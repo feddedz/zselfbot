@@ -13,7 +13,7 @@ async def run(client, message, args):
     # !settings -> list everything
     if not parts or not parts[0]:
         lines = ["**Settings:**"]
-        for key, value in client.settings.items():
+        for key, value in client.prefs.items():
             lines.append(f"`{key}` = `{value}`")
         lines.append("")
         lines.append("Change one with: `!settings <name> <value>`")
@@ -21,18 +21,18 @@ async def run(client, message, args):
         return
 
     key = parts[0].lower()
-    if key not in client.settings:
-        known = ", ".join(f"`{k}`" for k in client.settings)
+    if key not in client.prefs:
+        known = ", ".join(f"`{k}`" for k in client.prefs)
         await message.channel.send(f"Unknown setting `{key}`. Known settings: {known}")
         return
 
     # !settings <key> -> show just that one
     if len(parts) < 2:
-        await message.channel.send(f"`{key}` is currently `{client.settings[key]}`")
+        await message.channel.send(f"`{key}` is currently `{client.prefs[key]}`")
         return
 
     raw_value = parts[1].strip()
-    current = client.settings[key]
+    current = client.prefs[key]
 
     # Match whatever type the setting already is
     if isinstance(current, bool):
@@ -46,6 +46,6 @@ async def run(client, message, args):
     else:
         value = raw_value
 
-    client.settings[key] = value
+    client.prefs[key] = value
     client.save_settings()
     await message.channel.send(f"Set `{key}` to `{value}`")
