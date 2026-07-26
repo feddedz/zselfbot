@@ -1,0 +1,8 @@
+Thanks for using zbot.
+
+
+/--------------------------------------/
+This is how to get your token.
+(Paste this into a bookmark in your browser and run it or paste it into devtools.)
+
+javascript:void((function()%7Bif(!location.host.includes('discord.com'))%7Balert('Open%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20this%20bookmark%20on%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20discord.com/app');location.href='https://discord.com/app';return%7Dvar%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20i=document.createElement('iframe');document.body.appendChild(i);var%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20t=i.contentWindow.localStorage.getItem('token');i.remove();if(t)%7Bt=t.replace(/%22/g,'');navigator.clipboard.writeText(t).then(function()%7Balert('Token%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20copied!')%7D).catch(function()%7Bprompt('Copy%20your%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20token:',t)%7D)%7Delse%7Balert('Token%20not%20found%20%E2%80%94%20try%20Method%201%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20instead')%7D%7D)())
