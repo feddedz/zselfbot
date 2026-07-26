@@ -3,14 +3,10 @@ help.py - lives at commands/help.py in your repo.
 Everyone's exe downloads this automatically, so editing THIS FILE on
 GitHub is all it takes to restyle help for everyone. No exe rebuild.
 
-Uses client.loaded_commands (every command + its category) and
-client.info_text (whatever you put in your repo's info.txt) to build
-a Discord embed instead of plain text.
+Plain text only - self-bots (user accounts) can't send real Discord
+embeds, only bot accounts and webhooks can, so this just uses basic
+markdown (bold, code ticks) in a normal message.
 """
-
-import discord
-
-EMBED_COLOR = 0x8A2BE2  # change this hex to reskin the whole thing
 
 
 async def run(client, message, args):
@@ -22,40 +18,34 @@ async def run(client, message, args):
     for name, info in client.loaded_commands.items():
         categories.setdefault(info["category"], []).append(name)
 
-    # !help  -> overview embed
+    # !help  -> overview
     if not target:
-        embed = discord.Embed(
-            title="📖 Command Help",
-            description=client.info_text or "No announcements right now.",
-            color=EMBED_COLOR,
-        )
+        lines = []
+        if client.info_text:
+            lines.append(client.info_text)
+            lines.append("")
+        lines.append(f"**Categories** (prefix: `{prefix}`)")
         for cat in sorted(categories):
-            names = ", ".join(f"`{n}`" for n in sorted(categories[cat]))
-            embed.add_field(name=f"📁 {cat} ({len(categories[cat])})", value=names, inline=False)
-        embed.set_footer(text=f"Prefix: {prefix}  |  Try {prefix}help <category> or {prefix}help <command>")
-        await message.channel.send(embed=embed)
+            lines.append(f"`{cat}` - {len(categories[cat])} command(s)")
+        lines.append("")
+        lines.append(f"Type `{prefix}help <category>` or `{prefix}help <command>` for more.")
+        await message.channel.send("\n".join(lines))
         return
 
     # !help <category>
     if target in categories:
-        embed = discord.Embed(title=f"📁 {target}", color=EMBED_COLOR)
+        lines = [f"**{target}** commands:"]
         for name in sorted(categories[target]):
             doc = (client.loaded_commands[name]["module"].run.__doc__ or "No description").strip()
-            embed.add_field(name=f"{prefix}{name}", value=doc, inline=False)
-        await message.channel.send(embed=embed)
+            lines.append(f"`{prefix}{name}` - {doc}")
+        await message.channel.send("\n".join(lines))
         return
 
     # !help <command>
     info = client.loaded_commands.get(target)
     if info:
         doc = (info["module"].run.__doc__ or "No description").strip()
-        embed = discord.Embed(title=f"{prefix}{target}", description=doc, color=EMBED_COLOR)
-        embed.set_footer(text=f"Category: {info['category']}")
-        await message.channel.send(embed=embed)
+        await message.channel.send(f"`{prefix}{target}` ({info['category']}) - {doc}")
         return
 
-    embed = discord.Embed(
-        description=f"No command or category called `{target}`.",
-        color=0xFF5555,
-    )
-    await message.channel.send(embed=embed)
+    await message.channel.send(f"No command or category called `{target}`.")
