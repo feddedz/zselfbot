@@ -1,24 +1,22 @@
+# ================================================================
+# updated help.py – hides 'owner' category and its commands
+# place at: commands/help.py
+# ================================================================
 """
-help.py - lives at commands/help.py in your repo.
-Everyone's exe downloads this automatically, so editing THIS FILE on
-GitHub is all it takes to restyle help for everyone. No exe rebuild.
-
-Plain text only - self-bots (user accounts) can't send real Discord
-embeds, only bot accounts and webhooks can, so this just uses basic
-markdown (bold, code ticks) in a normal message.
+help.py - shows commands and categories, excluding 'owner' category.
 """
-
-
 async def run(client, message, args):
-    """Shows commands and categories, or details on one"""
     prefix = client.cfg["prefix"]
     target = args.strip().lower()
 
     categories = {}
     for name, info in client.loaded_commands.items():
-        categories.setdefault(info["category"], []).append(name)
+        cat = info["category"]
+        # Hide owner category from help
+        if cat.lower() == "owner":
+            continue
+        categories.setdefault(cat, []).append(name)
 
-    # !help  -> overview
     if not target:
         lines = []
         if client.info_text:
@@ -32,7 +30,6 @@ async def run(client, message, args):
         await message.channel.send("\n".join(lines))
         return
 
-    # !help <category>
     if target in categories:
         lines = [f"**{target}** commands:"]
         for name in sorted(categories[target]):
@@ -41,9 +38,9 @@ async def run(client, message, args):
         await message.channel.send("\n".join(lines))
         return
 
-    # !help <command>
+    # Check if it's a command (but skip owner commands)
     info = client.loaded_commands.get(target)
-    if info:
+    if info and info["category"].lower() != "owner":
         doc = (info["module"].run.__doc__ or "No description").strip()
         await message.channel.send(f"`{prefix}{target}` ({info['category']}) - {doc}")
         return
