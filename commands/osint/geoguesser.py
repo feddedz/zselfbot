@@ -75,6 +75,17 @@ def haversine(lat1, lon1, lat2, lon2):
     a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
     return R * 2 * math.asin(math.sqrt(a))
 
+async def safe_send_embed(channel, embed):
+    """
+    Send an embed, compatible with both old (embed=) and new (embeds=) syntax.
+    """
+    try:
+        # Old discord.py: embed keyword
+        return await channel.send(embed=embed)
+    except TypeError:
+        # Newer versions that only accept embeds=list
+        return await channel.send(embeds=[embed])
+
 async def run(client, message, args):
     # Input validation
     if not args.strip():
@@ -203,7 +214,7 @@ async def run(client, message, args):
                     await status_msg.delete()
                 except Exception:
                     pass
-            await message.channel.send(embed=embed)
+            await safe_send_embed(message.channel, embed)
             return
 
         coords = []
@@ -229,7 +240,7 @@ async def run(client, message, args):
                     await status_msg.delete()
                 except Exception:
                     pass
-            await message.channel.send(embed=embed)
+            await safe_send_embed(message.channel, embed)
             return
 
         # Compute estimation
@@ -275,7 +286,7 @@ async def run(client, message, args):
             except Exception:
                 pass
 
-        await message.channel.send(embed=embed)
+        await safe_send_embed(message.channel, embed)
 
     except Exception as e:
         # Full traceback for debugging
