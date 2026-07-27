@@ -22,7 +22,7 @@ WORKER_ORD = "https://shiny-lab-d8d2.zkutchinsky4413.workers.dev"   # Original (
 WAIT_SECONDS = 25
 # =======================================
 
-# Cloudflare colo coordinates (same as before)
+# Cloudflare colo coordinates
 COLO_COORDS = {
     'EWR': {'lat': 40.6895, 'lon': -74.1745, 'name': 'Newark, NJ'},
     'IAD': {'lat': 38.9531, 'lon': -77.4475, 'name': 'Washington DC'},
@@ -114,9 +114,10 @@ async def scan_via_proxies(image_url):
     """
     Use the internal proxy list to probe the image URL from different locations.
     Returns a dict with the same structure as the worker: { url, checked, hits, datacenters, full_results }.
+    Never raises an exception; returns partial/empty data on failure.
     """
     results = []
-    sem = asyncio.Semaphore(20)  # limit concurrency
+    sem = asyncio.Semaphore(20)
 
     async def fetch_one(proxy):
         async with sem:
@@ -128,8 +129,8 @@ async def scan_via_proxies(image_url):
                         cf_ray = resp.headers.get('cf-ray', '')
                         cache_status = resp.headers.get('cf-cache-status', 'MISS')
                         colo = cf_ray.split('-')[-1] if '-' in cf_ray else 'UNKNOWN'
-                        return colo, cache_status
-            except:
+                        return (colo, cache_status)
+            except Exception:
                 return None
 
     tasks = [fetch_one(p) for p in PROXY_LIST]
@@ -137,7 +138,7 @@ async def scan_via_proxies(image_url):
 
     full_results = []
     for proxy, res in zip(PROXY_LIST, raw_responses):
-        if res:
+        if res is not None:
             colo, status = res
             full_results.append({"colo": colo, "status": status, "hit": status == "HIT"})
         else:
@@ -168,21 +169,27 @@ async def run(client, message, args):
         await message.channel.send("❌ Invalid user ID or mention.")
         return
 
+    # We'll try to keep a status message, but if it fails we ignore
+    status_msg = None
     try:
         status_msg = await message.channel.send("🖼️ Generating unique image...")
     except Exception:
-        status_msg = None
+        pass
 
     async def _update_status(text):
         if status_msg is None:
             return
         try:
             await status_msg.edit(content=text)
+        except discord.NotFound:
+            # Message was deleted; we can try to send a new one but it's okay to just ignore
+            pass
         except Exception:
             pass
 
     try:
         img_bytes = generate_random_image()
+
         await _update_status("📤 Uploading to Discord CDN...")
         try:
             sent = await message.channel.send(file=discord.File(img_bytes, filename="geo.png"))
@@ -190,6 +197,7 @@ async def run(client, message, args):
                 await message.channel.send("❌ No attachment URL returned.")
                 return
             image_url = sent.attachments[0].url
+            # Delete the temporary upload (ignore errors)
             try:
                 await sent.delete()
             except Exception:
@@ -198,7 +206,7 @@ async def run(client, message, args):
             await message.channel.send(f"❌ Failed to upload image: {e}")
             return
 
-        # Pre‑cache
+        # Pre-cache (optional)
         await _update_status("🌐 Pre-caching image on global CDN...")
         try:
             async with aiohttp.ClientSession() as session:
@@ -233,12 +241,12 @@ async def run(client, message, args):
                     async with session.get(api_ord, timeout=35) as resp:
                         if resp.status == 200:
                             return await resp.json()
-            except:
+            except Exception:
                 return None
 
         data_ord, data_proxy = await asyncio.gather(
             fetch_ord(),
-            scan_via_proxies(image_url)   # our internal scanner
+            scan_via_proxies(image_url)
         )
 
         # Merge results
@@ -262,7 +270,7 @@ async def run(client, message, args):
         if len(raw_json) > 1000:
             raw_json = raw_json[:1000] + "\n... (truncated)"
 
-        # Scanned colos
+        # Scanned colos summary
         probed_colos = []
         seen = set()
         for r in full_results:
@@ -283,6 +291,7 @@ async def run(client, message, args):
             f"**Estimated radius:** ~"
         )
 
+        # No hits case
         if not datacenters:
             embed = discord.Embed(
                 title="📍 GeoGuesser – No Cache Hits",
@@ -293,9 +302,12 @@ async def run(client, message, args):
             embed.add_field(name="🔬 Scanned Colos", value=colos_text, inline=False)
             embed.add_field(name="📄 Raw Merged Data", value=f"```json\n{raw_json}\n```", inline=False)
             embed.set_footer(text="No cache entry found. Target may not have downloaded the image.")
+            # Clean up status
             if status_msg:
-                try: await status_msg.delete()
-                except: pass
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
             await safe_send_embed(message.channel, embed)
             return
 
@@ -319,12 +331,14 @@ async def run(client, message, args):
             embed.add_field(name="🔬 Scanned Colos", value=colos_text, inline=False)
             embed.add_field(name="📄 Raw Merged Data", value=f"```json\n{raw_json}\n```", inline=False)
             if status_msg:
-                try: await status_msg.delete()
-                except: pass
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
             await safe_send_embed(message.channel, embed)
             return
 
-        # Compute center
+        # Compute center and radius
         center_lat = sum(c['lat'] for c in coords) / len(coords)
         center_lon = sum(c['lon'] for c in coords) / len(coords)
         max_dist = max(haversine(center_lat, center_lon, c['lat'], c['lon']) for c in coords)
@@ -351,8 +365,10 @@ async def run(client, message, args):
         embed.set_image(url=map_url)
 
         if status_msg:
-            try: await status_msg.delete()
-            except: pass
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
 
         await safe_send_embed(message.channel, embed)
 
@@ -361,5 +377,5 @@ async def run(client, message, args):
         error_msg = f"⚠️ Unexpected error: {e}"
         try:
             await message.channel.send(error_msg)
-        except:
+        except Exception:
             pass
