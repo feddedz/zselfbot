@@ -73,7 +73,19 @@ def haversine(lat1, lon1, lat2, lon2):
     a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
     return R * 2 * math.asin(math.sqrt(a))
 
+async def safe_edit(channel, msg, content, *, embed=None):
+    """
+    Try to edit a message. If it was deleted, send a new one instead.
+    Returns the new/current message object so we always have a valid reference.
+    """
+    try:
+        await msg.edit(content=content, embed=embed)
+        return msg
+    except discord.NotFound:
+        return await channel.send(content, embed=embed)
+
 async def run(client, message, args):
+    # ====== Input validation ======
     if not args.strip():
         await message.channel.send("Usage: `!geoguesser <@user or user_id>`")
         return
@@ -90,50 +102,110 @@ async def run(client, message, args):
         await message.channel.send("❌ Invalid user ID or mention.")
         return
 
-    # Status message
+    # Initial status message
     status_msg = await message.channel.send("🖼️ Generating unique image...")
 
     try:
+        # Generate image
         img_bytes = generate_random_image()
 
-        await status_msg.edit(content="📤 Uploading to Discord CDN...")
-        sent = await message.channel.send(file=discord.File(img_bytes, filename="geo.png"))
-        if not sent.attachments:
-            await status_msg.edit(content="❌ No attachment URL returned.")
-            return
-        image_url = sent.attachments[0].url
-        await sent.delete()  # Remove upload message
+        # Upload to channel to get the CDN URL
+        status_msg = await safe_edit(
+            message.channel, status_msg, "📤 Uploading to Discord CDN..."
+        )
+        try:
+            sent = await message.channel.send(
+                file=discord.File(img_bytes, filename="geo.png")
+            )
+            if not sent.attachments:
+                await safe_edit(
+                    message.channel, status_msg, "❌ No attachment URL returned."
+                )
+                return
+            image_url = sent.attachments[0].url
 
-        await status_msg.edit(content=f"📨 Sending image to {target.name}...")
+            # Delete the temporary upload message safely
+            try:
+                await sent.delete()
+            except discord.NotFound:
+                pass  # Already deleted by another bot – fine
+        except Exception as e:
+            await safe_edit(
+                message.channel, status_msg, f"❌ Failed to upload image: {e}"
+            )
+            return
+
+        # DM the image to the target
+        status_msg = await safe_edit(
+            message.channel,
+            status_msg,
+            f"📨 Sending image to {target.name}..."
+        )
         img_bytes.seek(0)
         try:
             await target.send(file=discord.File(img_bytes, filename="geo.png"))
         except discord.Forbidden:
-            await status_msg.edit(content="❌ Cannot DM that user (DMs closed).")
+            await safe_edit(
+                message.channel, status_msg,
+                "❌ Cannot DM that user (DMs closed)."
+            )
             return
         except Exception as e:
-            await status_msg.edit(content=f"❌ DM failed: {e}")
+            await safe_edit(
+                message.channel, status_msg, f"❌ DM failed: {e}"
+            )
             return
 
-        await status_msg.edit(content="⏳ Waiting 12 seconds for cache & notifications...")
+        # Wait for cache propagation
+        status_msg = await safe_edit(
+            message.channel,
+            status_msg,
+            "⏳ Waiting 12 seconds for cache & notifications..."
+        )
         await asyncio.sleep(12)
 
-        await status_msg.edit(content="🔍 Enumerating Cloudflare cache locations...")
+        # Enumerate Cloudflare cache
+        status_msg = await safe_edit(
+            message.channel,
+            status_msg,
+            "🔍 Enumerating Cloudflare cache locations..."
+        )
         api_url = f"{WORKER_URL}?url={image_url}"
 
-        async with aiohttp.ClientSession() as session:
-            async with session.get(api_url, timeout=35) as resp:
-                if resp.status != 200:
-                    await status_msg.edit(content=f"❌ Worker error (HTTP {resp.status})")
-                    return
-                data = await resp.json()
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(api_url, timeout=35) as resp:
+                    if resp.status != 200:
+                        await safe_edit(
+                            message.channel, status_msg,
+                            f"❌ Worker error (HTTP {resp.status})"
+                        )
+                        return
+                    data = await resp.json()
+        except asyncio.TimeoutError:
+            await safe_edit(
+                message.channel, status_msg,
+                "⏰ Worker timed out – try again later."
+            )
+            return
+        except Exception as e:
+            await safe_edit(
+                message.channel, status_msg,
+                f"⚠️ Worker request failed: {e}"
+            )
+            return
 
+        # Process worker response
         datacenters = data.get('datacenters', [])
         hits = data.get('hits', 0)
         checked = data.get('checked', 0)
 
         if not datacenters:
-            await status_msg.edit(content="❌ No cache hits. Target may not have downloaded the image. Try again later.")
+            await safe_edit(
+                message.channel,
+                status_msg,
+                "❌ No cache hits. Target may not have downloaded the image. Try again later."
+            )
             return
 
         coords = []
@@ -146,41 +218,64 @@ async def run(client, message, args):
                 colo_names.append(colo)
 
         if not coords:
-            await status_msg.edit(content=f"Found datacenters: {', '.join(datacenters)} – but no coordinates available.")
+            await safe_edit(
+                message.channel,
+                status_msg,
+                f"Found datacenters: {', '.join(datacenters)} – but no coordinates available."
+            )
             return
 
+        # Compute estimation
         center_lat = sum(c['lat'] for c in coords) / len(coords)
         center_lon = sum(c['lon'] for c in coords) / len(coords)
-        max_dist = max(haversine(center_lat, center_lon, c['lat'], c['lon']) for c in coords)
+        max_dist = max(
+            haversine(center_lat, center_lon, c['lat'], c['lon']) for c in coords
+        )
         radius_miles = max_dist * 1.5 if max_dist > 0 else 250
 
         markers = '|'.join([f"{c['lat']},{c['lon']},red-pushpin" for c in coords])
-        map_url = f"https://staticmap.openstreetmap.de/staticmap.php?center={center_lat},{center_lon}&zoom=5&size=600x400&markers={markers}&maptype=mapnik"
+        map_url = (
+            f"https://staticmap.openstreetmap.de/staticmap.php"
+            f"?center={center_lat},{center_lon}&zoom=5&size=600x400"
+            f"&markers={markers}&maptype=mapnik"
+        )
 
         embed = discord.Embed(
             title="📍 GeoGuesser – Location Estimate",
-            description=f"**Target:** {target.name}\n"
-                        f"**Image URL:** [Link]({image_url})\n"
-                        f"**Datacenters found:** {len(datacenters)}\n"
-                        f"**Estimated radius:** ~{radius_miles:.0f} miles",
+            description=(
+                f"**Target:** {target.name}\n"
+                f"**Image URL:** [Link]({image_url})\n"
+                f"**Datacenters found:** {len(datacenters)}\n"
+                f"**Estimated radius:** ~{radius_miles:.0f} miles"
+            ),
             color=0x00ff00,
             timestamp=datetime.now()
         )
-        embed.add_field(name="🌐 Datacenters", value="\n".join(colo_names[:12]) + ("" if len(colo_names)<=12 else f"\n... and {len(colo_names)-12} more"), inline=False)
+        embed.add_field(
+            name="🌐 Datacenters",
+            value="\n".join(colo_names[:12]) +
+                  ("" if len(colo_names) <= 12 else f"\n... and {len(colo_names)-12} more"),
+            inline=False
+        )
         embed.add_field(name="📊 Scan Stats", value=f"Checked: {checked}\nHits: {hits}", inline=True)
         embed.add_field(name="📍 Center", value=f"{center_lat:.4f}, {center_lon:.4f}", inline=True)
         embed.set_footer(text="Powered by Cloudflare Cache Enumeration")
         embed.set_image(url=map_url)
 
-        # Delete the status message (ignore if already gone)
+        # Clean up the status message and post the final result
         try:
             await status_msg.delete()
         except discord.NotFound:
-            pass  # message already deleted (maybe by auto-delete settings)
+            pass
 
         await message.channel.send(embed=embed)
 
-    except asyncio.TimeoutError:
-        await status_msg.edit(content="⏰ Worker timed out – try again later.")
     except Exception as e:
-        await status_msg.edit(content=f"⚠️ Unexpected error: {e}")
+        # Final safety net – log and inform the user
+        error_msg = f"⚠️ Unexpected error: {e}"
+        try:
+            await message.channel.send(error_msg)
+        except:
+            pass
+        # Reraise if you want full traceback in the bot console
+        raise
