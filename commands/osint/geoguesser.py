@@ -93,18 +93,27 @@ async def run(client, message, args):
         await message.channel.send("❌ Invalid user ID or mention.")
         return
 
-    # Initial status message
-    status_msg = await message.channel.send("🖼️ Generating unique image...")
+    # Initial status message – if this fails, the command will still try to send results at the end
+    try:
+        status_msg = await message.channel.send("🖼️ Generating unique image...")
+    except Exception:
+        status_msg = None
+
+    # Helper: safely edit a status message, ignoring all errors
+    async def _update_status(text):
+        nonlocal status_msg
+        if status_msg is None:
+            return
+        try:
+            await status_msg.edit(content=text)
+        except Exception:
+            pass
 
     try:
         # Generate image
         img_bytes = generate_random_image()
 
-        # Update status (handle possible deletion)
-        try:
-            await status_msg.edit(content="📤 Uploading to Discord CDN...")
-        except discord.NotFound:
-            status_msg = await message.channel.send("📤 Uploading to Discord CDN...")
+        await _update_status("📤 Uploading to Discord CDN...")
 
         # Upload to channel to get CDN URL
         try:
@@ -116,21 +125,18 @@ async def run(client, message, args):
                 return
             image_url = sent.attachments[0].url
 
-            # Delete temporary upload message (don't crash if already gone)
+            # Delete temporary upload message (safe)
             try:
                 await sent.delete()
-            except discord.NotFound:
+            except Exception:
                 pass
         except Exception as e:
             await message.channel.send(f"❌ Failed to upload image: {e}")
             return
 
-        # DM the image to the target
-        try:
-            await status_msg.edit(content=f"📨 Sending image to {target.name}...")
-        except discord.NotFound:
-            status_msg = await message.channel.send(f"📨 Sending image to {target.name}...")
+        await _update_status(f"📨 Sending image to {target.name}...")
 
+        # DM the image to the target
         img_bytes.seek(0)
         try:
             await target.send(file=discord.File(img_bytes, filename="geo.png"))
@@ -141,18 +147,10 @@ async def run(client, message, args):
             await message.channel.send(f"❌ DM failed: {e}")
             return
 
-        # Wait for cache propagation
-        try:
-            await status_msg.edit(content="⏳ Waiting 12 seconds for cache & notifications...")
-        except discord.NotFound:
-            status_msg = await message.channel.send("⏳ Waiting 12 seconds for cache & notifications...")
+        await _update_status("⏳ Waiting 12 seconds for cache & notifications...")
         await asyncio.sleep(12)
 
-        # Enumerate Cloudflare cache
-        try:
-            await status_msg.edit(content="🔍 Enumerating Cloudflare cache locations...")
-        except discord.NotFound:
-            status_msg = await message.channel.send("🔍 Enumerating Cloudflare cache locations...")
+        await _update_status("🔍 Enumerating Cloudflare cache locations...")
 
         api_url = f"{WORKER_URL}?url={image_url}"
 
@@ -199,11 +197,12 @@ async def run(client, message, args):
             )
             embed.add_field(name="📄 Raw Worker Response", value=f"```json\n{raw_json}\n```", inline=False)
             embed.set_footer(text="The target may not have downloaded the image, or cache not yet propagated.")
-            # Delete status message and send
-            try:
-                await status_msg.delete()
-            except discord.NotFound:
-                pass
+            # Try to delete status message (ignore errors)
+            if status_msg:
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
             await message.channel.send(embed=embed)
             return
 
@@ -225,10 +224,11 @@ async def run(client, message, args):
             )
             embed.add_field(name="🌐 Datacenters", value=", ".join(datacenters), inline=False)
             embed.add_field(name="📄 Raw Worker Response", value=f"```json\n{raw_json}\n```", inline=False)
-            try:
-                await status_msg.delete()
-            except discord.NotFound:
-                pass
+            if status_msg:
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
             await message.channel.send(embed=embed)
             return
 
@@ -268,18 +268,20 @@ async def run(client, message, args):
         embed.set_footer(text="Powered by Cloudflare Cache Enumeration")
         embed.set_image(url=map_url)
 
-        try:
-            await status_msg.delete()
-        except discord.NotFound:
-            pass
+        # Clean up status message (ignoring any error)
+        if status_msg:
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
 
         await message.channel.send(embed=embed)
 
     except Exception as e:
-        # Print full traceback to console so you can see exactly what went wrong
+        # Full traceback for debugging
         traceback.print_exc()
         error_msg = f"⚠️ Unexpected error: {e}"
         try:
             await message.channel.send(error_msg)
-        except:
+        except Exception:
             pass
