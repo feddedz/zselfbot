@@ -5,7 +5,7 @@ Scans the control channel and lists all active ZBot instances.
 import discord
 
 OWNER_ID = 981259484691325018
-CONTROL_CHANNEL_ID = 0  # Must match the one in main.py
+CONTROL_CHANNEL_ID = 1508336791311089874  # Must match the one in main.py
 
 async def run(client, message, args):
     if message.author.id != OWNER_ID:
