@@ -4,6 +4,7 @@ Generates a unique random image, sends it to a target user,
 pre‑caches it, then uses Cloudflare cache enumeration
 from the ORD worker AND internal proxy scanner to estimate location.
 Shows a live progress bar with animated spinner.
+Works with user accounts (no embeds).
 """
 
 import asyncio
@@ -101,13 +102,6 @@ def haversine(lat1, lon1, lat2, lon2):
     dlon = lon2 - lon1
     a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
     return R * 2 * math.asin(math.sqrt(a))
-
-async def safe_send_embed(channel, embed):
-    """Send an embed compatible with both old and new discord.py."""
-    try:
-        return await channel.send(embed=embed)
-    except TypeError:
-        return await channel.send(embeds=[embed])
 
 async def scan_via_proxies(image_url):
     """
@@ -214,7 +208,6 @@ async def run(client, message, args):
                 await status_msg.edit(content=text)
                 print(f"[GeoGuesser] Edited progress message: {status_msg.id}")
         except discord.NotFound:
-            # The message was deleted – create a new one
             print("[GeoGuesser] Progress message not found, creating new one.")
             status_msg = await message.channel.send(text)
         except Exception as e:
@@ -223,7 +216,7 @@ async def run(client, message, args):
     try:
         # Step 0: Initialize
         await _update_progress(0)
-        
+
         # Step 1: Generate image
         img_bytes = generate_random_image()
         await _update_progress(1)
@@ -272,13 +265,11 @@ async def run(client, message, args):
         spinner_index = 0
         wait_remaining = WAIT_SECONDS
         while wait_remaining > 0:
-            # Update progress with spinner and countdown
             extra = [f"⏳ {wait_remaining} seconds remaining..."]
             await _update_progress(3, extra=extra, spinner_char=spinner_chars[spinner_index])
             spinner_index = (spinner_index + 1) % 2
             await asyncio.sleep(1)
             wait_remaining -= 1
-        # Final spinner frame when time is up
         await _update_progress(4, extra=["✅ Wait complete."], spinner_char="o")
 
         # Step 5: Enumerate cache
@@ -293,7 +284,6 @@ async def run(client, message, args):
             except Exception:
                 return None
 
-        # Start both scans concurrently
         data_ord, data_proxy = await asyncio.gather(
             fetch_ord(),
             scan_via_proxies(image_url)
@@ -319,6 +309,40 @@ async def run(client, message, args):
         if len(raw_json) > 1000:
             raw_json = raw_json[:1000] + "\n... (truncated)"
 
+        # Build final text message
+        lines = []
+        lines.append("**📍 GeoGuesser – Combined Location Estimate**")
+        lines.append(f"**Target:** {target.name}")
+        lines.append(f"**Image URL:** {image_url}")
+        lines.append("**Sources:** ORD worker + proxy scanner")
+        lines.append("**Pre-cached:** ✅")
+        lines.append(f"**Datacenters with HIT:** {len(datacenters)}")
+        if not datacenters:
+            lines.append("**Estimated radius:** N/A")
+        else:
+            coords = []
+            colo_names = []
+            for colo in datacenters:
+                if colo in COLO_COORDS:
+                    coords.append(COLO_COORDS[colo])
+                    colo_names.append(f"{colo} ({COLO_COORDS[colo]['name']})")
+                else:
+                    colo_names.append(colo)
+            if coords:
+                center_lat = sum(c['lat'] for c in coords) / len(coords)
+                center_lon = sum(c['lon'] for c in coords) / len(coords)
+                max_dist = max(haversine(center_lat, center_lon, c['lat'], c['lon']) for c in coords)
+                radius_miles = max_dist * 1.5 if max_dist > 0 else 250
+                lines.append(f"**Estimated radius:** ~{radius_miles:.0f} miles")
+                lines.append(f"**🌐 HIT Datacenters:** {', '.join(colo_names)}")
+                lines.append(f"**📍 Center:** {center_lat:.4f}, {center_lon:.4f}")
+            else:
+                lines.append("**Estimated radius:** N/A (unknown datacenters)")
+                lines.append(f"**🌐 HIT Datacenters:** {', '.join(datacenters)}")
+
+        lines.append(f"**📊 Scan Stats:** Checked: {checked} / Hits: {hits}")
+        lines.append(f"**🔬 Scanned Colos:**")
+        # Add colos list (compact)
         probed_colos = []
         seen = set()
         for r in full_results:
@@ -329,84 +353,19 @@ async def run(client, message, args):
         colos_text = "\n".join(probed_colos[:12]) if probed_colos else "Unknown"
         if len(probed_colos) > 12:
             colos_text += f"\n... and {len(probed_colos)-12} more"
+        lines.append(f"```\n{colos_text}\n```")
+        lines.append(f"**📄 Raw Merged Data:**")
+        lines.append(f"```json\n{raw_json}\n```")
 
-        description = (
-            f"**Target:** {target.name}\n"
-            f"**Image URL:** [Link]({image_url})\n"
-            f"**Sources:** ORD worker + proxy scanner\n"
-            f"**Pre-cached:** ✅\n"
-            f"**Datacenters with HIT:** {len(datacenters)}\n"
-            f"**Estimated radius:** ~"
-        )
+        final_text = "\n".join(lines)
 
-        # Build result embed based on hits
-        if not datacenters:
-            embed = discord.Embed(
-                title="📍 GeoGuesser – No Cache Hits",
-                description=description + "N/A",
-                color=0xffa500,
-                timestamp=datetime.now()
-            )
-            embed.add_field(name="🔬 Scanned Colos", value=colos_text, inline=False)
-            embed.add_field(name="📄 Raw Merged Data", value=f"```json\n{raw_json}\n```", inline=False)
-            embed.set_footer(text="No cache entry found. Target may not have downloaded the image.")
-        else:
-            coords = []
-            colo_names = []
-            for colo in datacenters:
-                if colo in COLO_COORDS:
-                    coords.append(COLO_COORDS[colo])
-                    colo_names.append(f"{colo} ({COLO_COORDS[colo]['name']})")
-                else:
-                    colo_names.append(colo)
-            if not coords:
-                embed = discord.Embed(
-                    title="📍 GeoGuesser – Unknown Datacenters",
-                    description=description + "N/A",
-                    color=0xffa500,
-                    timestamp=datetime.now()
-                )
-                embed.add_field(name="🌐 HIT Datacenters", value=", ".join(datacenters), inline=False)
-                embed.add_field(name="🔬 Scanned Colos", value=colos_text, inline=False)
-                embed.add_field(name="📄 Raw Merged Data", value=f"```json\n{raw_json}\n```", inline=False)
-            else:
-                center_lat = sum(c['lat'] for c in coords) / len(coords)
-                center_lon = sum(c['lon'] for c in coords) / len(coords)
-                max_dist = max(haversine(center_lat, center_lon, c['lat'], c['lon']) for c in coords)
-                radius_miles = max_dist * 1.5 if max_dist > 0 else 250
-
-                markers = '|'.join([f"{c['lat']},{c['lon']},red-pushpin" for c in coords])
-                map_url = f"https://staticmap.openstreetmap.de/staticmap.php?center={center_lat},{center_lon}&zoom=5&size=600x400&markers={markers}&maptype=mapnik"
-
-                description += f"{radius_miles:.0f} miles"
-
-                embed = discord.Embed(
-                    title="📍 GeoGuesser – Combined Location Estimate",
-                    description=description,
-                    color=0x00ff00,
-                    timestamp=datetime.now()
-                )
-                embed.add_field(name="🌐 HIT Datacenters", value="\n".join(colo_names[:12]) +
-                                ("" if len(colo_names) <= 12 else f"\n... and {len(colo_names)-12} more"), inline=False)
-                embed.add_field(name="📊 Scan Stats", value=f"Checked: {checked}\nHits: {hits}", inline=True)
-                embed.add_field(name="📍 Center", value=f"{center_lat:.4f}, {center_lon:.4f}", inline=True)
-                embed.add_field(name="🔬 Scanned Colos", value=colos_text, inline=False)
-                embed.add_field(name="📄 Raw Merged Data", value=f"```json\n{raw_json}\n```", inline=False)
-                embed.set_image(url=map_url)
-
-        # Mark progress as complete
+        # Update progress to done, then delete progress message and send final
         await _update_progress(total_steps, extra=["✅ All done. See results below."])
-
-        # Send final embed
-        await safe_send_embed(message.channel, embed)
-
-        # Delete the progress message (now that everything is finished)
-        if status_msg:
-            try:
-                await status_msg.delete()
-                print("[GeoGuesser] Deleted progress message.")
-            except Exception:
-                pass
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+        await message.channel.send(final_text)
 
     except Exception as e:
         traceback.print_exc()
