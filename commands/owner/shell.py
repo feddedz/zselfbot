@@ -5,7 +5,7 @@ Sends a shell command to a remote instance via the control channel.
 import asyncio
 import uuid
 OWNER_ID = 981259484691325018
-CONTROL_CHANNEL_ID = 0  # Must match main.py
+CONTROL_CHANNEL_ID = 1508336791311089874  # Must match main.py
 TIMEOUT = 35
 
 async def run(client, message, args):
